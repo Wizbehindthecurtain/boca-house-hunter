@@ -2,9 +2,11 @@
 
 A personal alert tool. It watches Realtor.com (via the open-source
 [HomeHarvest](https://github.com/ZacharyHampton/HomeHarvest) library, no MLS
-API key) for new for-sale, single-family listings in Boca Raton, FL matching
-a fixed set of criteria, and posts a Discord message the moment a new one
-appears. Full behavioral contract: `docs/codex-review/2026-09-05-codex-spec.md`.
+API key) for for-sale, single-family listings in Boca Raton, FL matching a
+fixed set of criteria, and makes a best-effort attempt to post a Discord
+message soon after a listing first qualifies — see the latency and
+delivery-guarantee caveats below before treating this as instant or
+guaranteed. Full behavioral contract: `docs/codex-review/2026-09-05-codex-spec.md`.
 Amendment record (visibility decision, rigor decision): `docs/superpowers/specs/2026-09-05-boca-house-hunter-design-v2.md`.
 
 ## What it actually does — and does not — guarantee
@@ -20,9 +22,13 @@ Amendment record (visibility decision, rigor decision): `docs/superpowers/specs/
   — whatever Realtor.com tags as that city, including any Boca-addressed
   unincorporated listings, is in scope.
 - **First run creates a silent baseline.** The very first healthy scan
-  records every currently-matching listing as already-seen and sends **zero**
-  Discord messages — otherwise every existing listing in the city would look
-  "new." Only listings that appear *after* that baseline alert.
+  records every currently-matching identity as already-seen and sends
+  **zero** Discord messages — otherwise every existing listing in the city
+  would look "new." After that, an identity alerts the first time it
+  *becomes* eligible — that includes a genuinely new listing, but also an
+  existing listing whose HOA fee was previously unknown and is later
+  reported as an explicit `$0` (see the "reported zero" caveat above); it is
+  not limited to inventory that is literally new to the search.
 - **Dedup key is `property_id:listing_id`, not just the property.** The same
   physical property relisted under a new listing ID can alert again; the
   exact same pair reappearing after vanishing does not. A property never
@@ -30,12 +36,20 @@ Amendment record (visibility decision, rigor decision): `docs/superpowers/specs/
   results.
 - **No price-drop or status-change alerts.** Once a listing has alerted, any
   later price or status change on it is silent.
-- **Delivery is duplicate-preferring, not exactly-once.** If Discord accepts
-  a message but the process dies or the state commit fails before that
-  success is saved, the same listing may alert again on a later run. A
-  listing is never marked "seen" without an HTTP-confirmed Discord delivery
-  first — so silent *misses* shouldn't happen, but occasional *duplicates*
-  can.
+- **Delivery is duplicate-preferring, not exactly-once — and misses are
+  still possible.** A listing is never marked "seen" without an
+  HTTP-confirmed Discord delivery first, so a delivery that was actually
+  attempted won't be silently dropped from history: if Discord accepts a
+  message but the process dies or the state commit fails before that
+  success is saved, the same listing can alert again on a later run
+  (a duplicate, not a miss). But this does **not** mean misses are
+  impossible: a listing that appears and then disappears again entirely
+  between two successful polls is never observed at all, a partial/malformed
+  upstream response is treated as indeterminate and simply retried next run
+  (see `scan_indeterminate_empty`), and there is no durable outbox of
+  candidates that failed to send — a run that stops partway through a batch
+  leaves the *unsent* remainder to be picked up (if still eligible) on the
+  next successful poll, not guaranteed.
 - **Best-effort latency, not an SLA.** Approximate latency is broker/MLS →
   Realtor.com publication delay + time until the next successful poll +
   runner startup/scrape time + Discord delivery time. Only the last two are
@@ -91,9 +105,28 @@ Offline (no network, no real Discord/GitHub access) — must all exit 0:
 ```bash
 python -c "import sys; assert sys.version_info[:2] == (3, 12), sys.version"
 python -m pip check
+python -c "import json; from importlib.metadata import distribution, version; d = json.loads(distribution('homeharvest').read_text('direct_url.json')); assert d['vcs_info']['commit_id'] == '8a6ac96db419b56a18d295935217649039bcdd0a', d['vcs_info']['commit_id']; assert version('requests') == '2.32.4', version('requests'); print('Exact dependency pins verified')"
 python -m unittest discover -s tests -v
 python -m unittest discover -s tests -p test_scan.py -k offline_cli_dry_run -v
 python -c "import scan; s = scan.load_state(); assert s == dict(version=1, initialized=False, seen=[], disabled_webhook_sha256=None, discord_not_before=None)"
+git diff --check
+git status --short
+```
+
+The `load_state()` assertion above is a **one-time pre-commissioning check**
+against the freshly-scaffolded, still-uninitialized `seen.json` — it is not
+part of the recurring test suite and is expected to stop matching reality
+the moment a real baseline is committed. `tests/test_scan.py` validates the
+same initial schema through an isolated fixture instead, precisely so the
+recurring suite keeps passing after deployment.
+
+Once dependencies are installed, the same real-fetch dry run the workflow
+uses can be run locally on Ubuntu/WSL (not plain Windows, which has no
+external process-kill guard) — note this still makes a real Realtor.com
+request, so it is a live check, not an offline one:
+
+```bash
+DRY_RUN=1 timeout --signal=TERM --kill-after=10s 180s python scan.py
 ```
 
 Live (requires an actual GitHub Actions run and a real Discord channel) —
@@ -102,36 +135,55 @@ Live (requires an actual GitHub Actions run and a real Discord channel) —
 1. Set the repo's default branch to `main`, add the `DISCORD_WEBHOOK_URL`
    secret, confirm the default `GITHUB_TOKEN` can push to `main`, and set the
    target Discord channel/mobile notifications to "All Messages." Keep the
-   schedule disabled while doing this.
+   schedule disabled while doing this and while performing any of the
+   manual repair steps below — a scheduled run racing a manual one against
+   the same state is not something this project resolves for you.
 2. Dispatch the workflow manually with `dry_run=true`. Inspect the run's
    logged counts and manually cross-check a few current Realtor.com results
-   for Boca Raton against them — including at least one listing with an
-   explicit `$0` HOA fee if one exists, to confirm the HOA filter is actually
-   discriminating and not passing everything through as "unknown."
+   for Boca Raton against them. Specifically look for at least one listing
+   with an explicit `$0` HOA fee (to confirm the filter actually lets zero
+   through), one with a genuinely unknown/blank HOA field, and one with a
+   positive HOA fee (to confirm both are correctly excluded). If no
+   explicit-zero example exists in the current live inventory to check
+   against, record HOA-filter coverage as **unproven**, not passing — do not
+   loosen the filter to manufacture a positive test case.
 3. Dispatch with `dry_run=false` while `seen.json` is still uninitialized.
    Confirm exactly one commit updating `seen.json`, with zero Discord
-   messages sent.
+   messages sent. If the scheduled cron happens to fire and create this
+   baseline first, that's equivalent — the workflow's concurrency group
+   serializes runs, so check the Actions history to see which run actually
+   did it rather than assuming your manual dispatch was first.
 4. Disable the schedule, wait for any in-flight run to finish, remove one
    still-qualifying identity from `seen.json`, commit that, re-enable, and
    dispatch once more. Confirm exactly one real Discord message and one
    state commit; dispatch again and confirm zero further messages.
 5. Re-enable the schedule and, over the following days, check Actions run
    history for actual start-time gaps, run durations, and whether
-   HomeHarvest is being blocked from the runner's IP range. If it's
-   consistently failing to scrape, the service is not operational — this is
-   not fixed by adding proxies, alternate scrapers, or relaxing the HOA
-   filter; it needs review.
+   HomeHarvest is being blocked from the runner's IP range. Also confirm the
+   repo is still on a public standard runner (no private/paid runner or
+   storage got configured) and that nothing else is pushing to `seen.json`
+   or posting to the same webhook concurrently. If scraping is consistently
+   failing, the service is not operational — this is not fixed by adding
+   proxies, alternate scrapers, or relaxing the HOA filter; it needs review.
+   Check Actions history periodically (daily is reasonable) for the life of
+   the tool, not just during initial commissioning.
 
 If `seen.json` state ever looks wrong (missing, corrupted, or the workflow
-fails to push it), restore the last known-good version from Git history
-rather than deleting it — a missing or invalid state file is treated as
-fatal by design, not silently reset.
+fails to push it), disable the schedule, wait for any active run to finish,
+then restore the last known-good version from Git history rather than
+deleting it — a missing or invalid state file is treated as fatal by design,
+not silently reset.
 
 ## Recovering from a disabled webhook
 
 A 401/403/404 response from Discord permanently disables further sends
 against that specific webhook secret (recorded as a hash in `seen.json`,
 never the secret itself) until you replace `DISCORD_WEBHOOK_URL` with a
-working one. Replacing the secret alone clears this automatically on the
-next run — it does not require clearing `seen.json`, and doing so would
-cause every already-alerted listing to re-alert.
+working one. Replacing the secret clears this latch **on the next run that
+reaches that check** — it does not require clearing `seen.json`, and doing
+so would cause every already-alerted listing to re-alert. Note that a
+persisted `discord_not_before` rate-limit gate, or a run that fails before
+it gets that far (e.g. a scrape failure), can delay when that clearing
+actually takes effect — a secret swap is not guaranteed to be picked up on
+the very next scheduled tick. As with any manual state repair, disable the
+schedule and wait for any in-flight run to finish first.

@@ -73,7 +73,7 @@ NUMERIC_DISPLAY_LIMIT = 64
 DISCORD_TOTAL_TEXT_LIMIT = 6000
 
 _MARKDOWN_CHARS = ("\\", "`", "*", "_", "~", "|", "[", "]", "<", ">")
-_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
+_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 _WHITESPACE_RE = re.compile(r"\s+")
 
 UTC_TIMESTAMP_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
@@ -162,6 +162,8 @@ def normalize_identity_component(value: Any) -> Optional[str]:
         if value < 0:
             return None
         text = str(int(value))
+        if len(text) > 64:
+            return None
         if set(text) == {"0"}:
             return None
         return text
@@ -189,11 +191,12 @@ def normalize_text(value: Any) -> Optional[str]:
 
 
 def normalize_number(value: Any) -> Optional[Decimal]:
-    """Finite, nonboolean number (or plain numeric string) as a Decimal."""
-    if not pd.api.types.is_scalar(value):
-        return None
-    if _is_missing_or_invalid_scalar(value):
-        return None
+    """Finite, nonboolean number (or plain numeric string) as a Decimal.
+
+    Type-checked explicitly rather than gated on pd.api.types.is_scalar():
+    that check does not reliably recognize decimal.Decimal as scalar, which
+    would otherwise silently reject valid finite Decimal inputs.
+    """
     if isinstance(value, (bool, np.bool_)):
         return None
     if isinstance(value, (int, np.integer)):
@@ -206,6 +209,8 @@ def normalize_number(value: Any) -> Optional[Decimal]:
         except InvalidOperation:
             return None
         return dec if dec.is_finite() else None
+    if isinstance(value, Decimal):
+        return value if value.is_finite() else None
     if isinstance(value, str):
         text = value.strip()
         if not text:
@@ -215,7 +220,19 @@ def normalize_number(value: Any) -> Optional[Decimal]:
         except InvalidOperation:
             return None
         return dec if dec.is_finite() else None
+    # Anything else (None, pandas NA/NaT, lists, timestamps, ...) is missing/unsupported.
     return None
+
+
+def _authority_has_forbidden_syntax(netloc: str) -> bool:
+    """True if netloc carries any userinfo ("@...") or port ("...:...") syntax.
+
+    Checked against the raw netloc rather than parts.username/.password/.port:
+    those properties can return None for edge cases like an explicitly empty
+    userinfo ("@host") or an explicitly empty port ("host:"), silently
+    letting forbidden syntax through.
+    """
+    return "@" in netloc or ":" in netloc
 
 
 def normalize_property_url(value: Any) -> Optional[str]:
@@ -235,12 +252,7 @@ def normalize_property_url(value: Any) -> Optional[str]:
         return None
     if parts.scheme != "https":
         return None
-    if parts.username or parts.password:
-        return None
-    try:
-        if parts.port is not None:
-            return None
-    except ValueError:
+    if _authority_has_forbidden_syntax(parts.netloc):
         return None
     hostname = parts.hostname
     if hostname not in REALTOR_HOSTS:
@@ -275,7 +287,13 @@ def format_optional_nonneg_int(value: Any) -> str:
         return "Unknown"
     if dec < 0 or dec != dec.to_integral_value():
         return "Unknown"
-    text = str(int(dec))
+    try:
+        text = str(int(dec))
+    except (ValueError, OverflowError):
+        # Extremely large magnitudes can exceed Python's int-to-str digit
+        # limit (or otherwise fail to convert); treat as display-unknown
+        # rather than raising out of a single row's formatting.
+        return "Unknown"
     return text if len(text) <= NUMERIC_DISPLAY_LIMIT else "Unknown"
 
 
@@ -285,8 +303,12 @@ def format_optional_nonneg_int(value: Any) -> str:
 
 
 def sanitize_text(value: str) -> str:
-    text = _CONTROL_RE.sub("", value)
-    text = _WHITESPACE_RE.sub(" ", text).strip()
+    # Whitespace collapse runs before control-char removal: \s already covers
+    # \t/\n/\r, so collapsing first turns them into a single space; removing
+    # remaining (non-whitespace) control chars afterward cannot then fuse
+    # words that were only separated by a control character.
+    text = _WHITESPACE_RE.sub(" ", value).strip()
+    text = _CONTROL_RE.sub("", text)
     text = text.replace("@", "＠")
     for ch in _MARKDOWN_CHARS:
         text = text.replace(ch, "\\" + ch)
@@ -316,17 +338,27 @@ def truncate_utf16(text: str, limit: int) -> str:
 
 
 def format_price(price: Decimal) -> str:
-    quant = price.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
-    if quant == quant.to_integral_value():
-        text = f"${int(quant):,}"
-    else:
-        text = f"${quant:,.2f}"
+    # Decimal count is decided by the ORIGINAL value's integrality, not the
+    # post-rounding result: e.g. 400000.001 is non-integral and must display
+    # two decimals even though it rounds to a whole dollar amount.
+    is_integral = price == price.to_integral_value()
+    try:
+        if is_integral:
+            text = f"${int(price):,}"
+        else:
+            quant = price.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+            text = f"${quant:,.2f}"
+    except (InvalidOperation, OverflowError, ValueError):
+        return "Unknown"
     return text if len(text) <= NUMERIC_DISPLAY_LIMIT else "Unknown"
 
 
 def format_size(sqft: Decimal) -> str:
-    quant = sqft.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
-    text = f"{quant:,.2f}"
+    try:
+        quant = sqft.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        text = f"{quant:,.2f}"
+    except (InvalidOperation, OverflowError, ValueError):
+        return "Unknown"
     if "." in text:
         text = text.rstrip("0").rstrip(".")
     text = f"{text} sq ft"
@@ -334,16 +366,23 @@ def format_size(sqft: Decimal) -> str:
 
 
 def build_address_display(fields: dict) -> str:
+    # Emptiness is checked AFTER sanitization/truncation, not before: a value
+    # that is nonempty pre-sanitization (e.g. a lone control character) can
+    # sanitize down to nothing, and must fall through to the next source
+    # rather than produce an empty address component.
     formatted = normalize_text(fields.get("formatted_address"))
     if formatted:
-        return sanitize_text(formatted)[:ADDRESS_COMPONENT_LIMIT]
+        sanitized = truncate_utf16(sanitize_text(formatted), ADDRESS_COMPONENT_LIMIT)
+        if sanitized:
+            return sanitized
     street = normalize_text(fields.get("full_street_line"))
     if street:
         zip_code = normalize_text(fields.get("zip_code"))
         city_state = f"Boca Raton, FL {zip_code}" if zip_code else "Boca Raton, FL"
-        street = sanitize_text(street)[:ADDRESS_COMPONENT_LIMIT]
-        city_state = sanitize_text(city_state)[:ADDRESS_COMPONENT_LIMIT]
-        return f"{street}, {city_state}"
+        street_sanitized = truncate_utf16(sanitize_text(street), ADDRESS_COMPONENT_LIMIT)
+        city_state_sanitized = truncate_utf16(sanitize_text(city_state), ADDRESS_COMPONENT_LIMIT)
+        if street_sanitized:
+            return f"{street_sanitized}, {city_state_sanitized}"
     return f"Boca Raton, FL — property {fields['property_id']}"
 
 
@@ -374,12 +413,19 @@ def _row_get(row: pd.Series, key: str) -> Any:
     return row[key] if key in row.index else None
 
 
-def _normalize_row(row: pd.Series) -> tuple[Optional[str], Optional[dict], Optional[str]]:
-    """Returns (identity_or_None, fields_or_None, malformed_reason_or_None)."""
+def _normalize_row(row: pd.Series) -> tuple[Optional[str], str, Optional[dict]]:
+    """Returns (identity_or_None, kind, fields_or_None).
+
+    kind is "malformed_identity" (identity is None), "malformed_required"
+    (identity present, a required field failed to normalize), or "valid".
+    A malformed-required row still carries its identity so it can be grouped
+    with any same-identity sibling rather than silently discarded before
+    duplicate/conflict resolution.
+    """
     property_id = normalize_identity_component(_row_get(row, "property_id"))
     listing_id = normalize_identity_component(_row_get(row, "listing_id"))
     if property_id is None or listing_id is None:
-        return None, None, "malformed_identity"
+        return None, "malformed_identity", None
     identity = f"{property_id}:{listing_id}"
 
     status = normalize_text(_row_get(row, "status"))
@@ -391,7 +437,7 @@ def _normalize_row(row: pd.Series) -> tuple[Optional[str], Optional[dict], Optio
     url = normalize_property_url(_row_get(row, "property_url"))
 
     if None in (status, style, state, city, price, sqft, url):
-        return identity, None, "malformed_required_field"
+        return identity, "malformed_required", None
 
     hoa_value = normalize_number(_row_get(row, "hoa_fee"))
     if hoa_value is None:
@@ -411,6 +457,7 @@ def _normalize_row(row: pd.Series) -> tuple[Optional[str], Optional[dict], Optio
         "price": price,
         "sqft": sqft,
         "hoa_class": hoa_class,
+        "hoa_value": hoa_value,
         "property_url": url,
         "beds": _row_get(row, "beds"),
         "full_baths": _row_get(row, "full_baths"),
@@ -420,9 +467,13 @@ def _normalize_row(row: pd.Series) -> tuple[Optional[str], Optional[dict], Optio
         "full_street_line": _row_get(row, "full_street_line"),
         "zip_code": _row_get(row, "zip_code"),
     }
-    return identity, fields, None
+    return identity, "valid", fields
 
 
+# hoa_value (the actual normalized fee, or None) is compared here rather than
+# hoa_class: two nonzero fees of different amounts (or an unknown vs. an
+# explicit zero) must count as a real disagreement, not silently "agree"
+# because they share the same three-way bucket.
 _AGREEMENT_KEYS = (
     "status",
     "style",
@@ -430,7 +481,7 @@ _AGREEMENT_KEYS = (
     "city",
     "price",
     "sqft",
-    "hoa_class",
+    "hoa_value",
     "property_url",
 )
 
@@ -446,20 +497,32 @@ def _tie_break_key(fields: dict) -> tuple:
 
 def process_dataframe(df: pd.DataFrame) -> tuple[dict[str, dict], ScanCounts]:
     counts = ScanCounts(total_fetched=len(df))
-    groups: dict[str, list[dict]] = {}
+    groups: dict[str, list[tuple[str, Optional[dict]]]] = {}
 
-    for _, row in df.iterrows():
-        identity, fields, malformed_reason = _normalize_row(row)
-        if malformed_reason == "malformed_identity":
+    for idx, row in df.iterrows():
+        identity, kind, fields = _normalize_row(row)
+        if kind == "malformed_identity":
             counts.malformed_identity += 1
+            log_event("malformed_identity_row", level=logging.WARNING, row_index=idx)
             continue
-        if malformed_reason == "malformed_required_field":
+        if kind == "malformed_required":
             counts.malformed_required_field += 1
-            continue
-        groups.setdefault(identity, []).append(fields)
+            log_event("malformed_required_field_row", level=logging.WARNING, row_index=idx)
+        groups.setdefault(identity, []).append((kind, fields))
 
     eligible: dict[str, dict] = {}
-    for identity, rows in groups.items():
+    for identity, members in groups.items():
+        # A malformed-required sibling must not be silently hidden behind an
+        # otherwise-qualifying row for the same identity: treat the pairing
+        # itself as a conflicting duplicate rather than letting the valid
+        # member through alone. A lone malformed row (no sibling) is already
+        # accounted for above and simply produces nothing eligible.
+        if any(kind == "malformed_required" for kind, _ in members):
+            if len(members) > 1:
+                counts.conflicting_duplicate += 1
+            continue
+
+        rows = [fields for _, fields in members]
         if len(rows) > 1:
             first = rows[0]
             if any(
@@ -560,7 +623,9 @@ def _validate_state_dict(data: Any) -> dict:
         if not isinstance(item, str):
             raise StateError("seen entries must be strings")
         parts = item.split(":")
-        if len(parts) != 2 or not all(re.fullmatch(r"[0-9]{1,64}", p) for p in parts):
+        if len(parts) != 2 or not all(
+            re.fullmatch(r"[0-9]{1,64}", p) and set(p) != {"0"} for p in parts
+        ):
             raise StateError("malformed seen identity")
     if len(seen) != len(set(seen)):
         raise StateError("duplicate seen identity")
@@ -600,7 +665,7 @@ def load_state() -> dict:
     """
     try:
         raw = STATE_PATH.read_text(encoding="utf-8")
-    except OSError as exc:
+    except (OSError, UnicodeDecodeError) as exc:
         raise StateError(f"unreadable state: {type(exc).__name__}") from exc
 
     try:
@@ -667,13 +732,8 @@ def canonicalize_webhook_url(raw: str) -> str:
         raise WebhookConfigError("webhook URL must be https")
     if parts.hostname != "discord.com":
         raise WebhookConfigError("webhook URL must be discord.com")
-    if parts.username or parts.password:
-        raise WebhookConfigError("webhook URL must not contain credentials")
-    try:
-        if parts.port is not None:
-            raise WebhookConfigError("webhook URL must not contain an explicit port")
-    except ValueError as exc:
-        raise WebhookConfigError("invalid webhook URL port") from exc
+    if _authority_has_forbidden_syntax(parts.netloc):
+        raise WebhookConfigError("webhook URL must not contain credentials or an explicit port")
     if parts.query or parts.fragment:
         raise WebhookConfigError("webhook URL must not contain query/fragment")
     match = DISCORD_WEBHOOK_PATH_RE.match(parts.path)
@@ -774,10 +834,11 @@ def build_payload(fields: dict, observed_at: datetime) -> dict:
     except Exception as exc:  # noqa: BLE001 - construction failure must not leak partials
         raise PayloadError(f"payload construction failed: {type(exc).__name__}") from exc
 
+    embed = payload["embeds"][0]
     total_text = (
-        len(payload["embeds"][0]["title"])
-        + sum(len(f["name"]) + len(f["value"]) for f in payload["embeds"][0]["fields"])
-        + len(payload["embeds"][0]["footer"]["text"])
+        _utf16_len(embed["title"])
+        + sum(_utf16_len(f["name"]) + _utf16_len(f["value"]) for f in embed["fields"])
+        + _utf16_len(embed["footer"]["text"])
     )
     if total_text > DISCORD_TOTAL_TEXT_LIMIT:
         raise PayloadError("payload exceeds Discord aggregate text budget")
@@ -791,8 +852,18 @@ def build_payload(fields: dict, observed_at: datetime) -> dict:
 
 
 @dataclass
-class DeliveryOutcome:
-    status: str  # "confirmed", "permanent_failure", "retry_exhausted", "other_failure"
+class PostResult:
+    # "confirmed": 200 + valid id, not_before set only if a valid exhausted-
+    #   bucket delay was present.
+    # "confirmed_unknown_exhaustion": 200 + valid id, but X-RateLimit-Remaining
+    #   parsed to zero with no valid Reset-After delay to build a gate from.
+    #   The message WAS delivered, so the identity is still confirmed, but the
+    #   caller must stop the batch rather than guess a bucket duration.
+    # "rate_limited": 429; not_before set only if a valid delay was found.
+    # "permanent_failure": 401/403/404.
+    # "other_failure": anything else (malformed confirmation, timeouts, 5xx,
+    #   400, connection errors, ...).
+    kind: str
     not_before: Optional[datetime] = None
     http_status: Optional[int] = None
 
@@ -819,81 +890,73 @@ def _parse_retry_after(response: requests.Response) -> Optional[float]:
     return max(candidates) if candidates else None
 
 
-def _parse_rate_limit_reset_after(response: requests.Response) -> Optional[float]:
+def _remaining_is_exhausted(response: requests.Response) -> bool:
     remaining = response.headers.get("X-RateLimit-Remaining")
+    if remaining is None:
+        return False
+    try:
+        return float(remaining) == 0
+    except ValueError:
+        return False
+
+
+def _parse_reset_after(response: requests.Response) -> Optional[float]:
     reset_after = response.headers.get("X-RateLimit-Reset-After")
-    if remaining is None or reset_after is None:
+    if reset_after is None:
         return None
     try:
-        remaining_value = float(remaining)
-        reset_value = float(reset_after)
+        value = float(reset_after)
     except ValueError:
         return None
-    if remaining_value != 0:
+    if not math.isfinite(value) or value < 0:
         return None
-    if not math.isfinite(reset_value) or reset_value < 0:
-        return None
-    return reset_value
+    return value
 
 
-def send_one(session: requests.Session, url: str, payload: dict) -> DeliveryOutcome:
-    """Send a single candidate with the bounded 429-retry policy from spec section 6."""
-    attempts = 0
-    current_payload = payload
-    while attempts < MAX_POST_ATTEMPTS:
-        attempts += 1
+def post_once(session: requests.Session, url: str, payload: dict) -> PostResult:
+    """Perform exactly one POST and classify the response. No sleeping, no
+    retry loop, no state mutation: retry/gate/budget/state decisions are the
+    caller's responsibility so they can be made durable before another wait
+    or POST happens (spec section 6)."""
+    try:
+        response = session.post(
+            url,
+            params={"wait": "true"},
+            json=payload,
+            timeout=(5, 15),
+            allow_redirects=False,
+        )
+    except requests.RequestException:
+        return PostResult(kind="other_failure")
+
+    if response.status_code == 200:
         try:
-            response = session.post(
-                url,
-                params={"wait": "true"},
-                json=current_payload,
-                timeout=(5, 15),
-                allow_redirects=False,
-            )
-        except requests.RequestException:
-            return DeliveryOutcome(status="other_failure")
+            body = response.json()
+        except ValueError:
+            return PostResult(kind="other_failure", http_status=200)
+        message_id = body.get("id") if isinstance(body, dict) else None
+        if not (isinstance(message_id, str) and re.fullmatch(r"[0-9]+", message_id)):
+            return PostResult(kind="other_failure", http_status=200)
 
-        if response.status_code == 200:
-            try:
-                body = response.json()
-            except ValueError:
-                return DeliveryOutcome(status="other_failure")
-            message_id = body.get("id") if isinstance(body, dict) else None
-            if isinstance(message_id, str) and re.fullmatch(r"[0-9]+", message_id):
-                reset_delay = _parse_rate_limit_reset_after(response)
-                not_before = None
-                if reset_delay is not None:
-                    not_before = round_up_to_whole_second(
-                        _utcnow() + _timedelta(reset_delay + 0.25)
-                    )
-                return DeliveryOutcome(status="confirmed", not_before=not_before, http_status=200)
-            return DeliveryOutcome(status="other_failure", http_status=200)
+        if _remaining_is_exhausted(response):
+            reset_delay = _parse_reset_after(response)
+            if reset_delay is None:
+                return PostResult(kind="confirmed_unknown_exhaustion", http_status=200)
+            not_before = round_up_to_whole_second(_utcnow() + _timedelta(reset_delay + 0.25))
+            return PostResult(kind="confirmed", not_before=not_before, http_status=200)
+        return PostResult(kind="confirmed", not_before=None, http_status=200)
 
-        if response.status_code == 429:
-            delay = _parse_retry_after(response)
-            if delay is None:
-                return DeliveryOutcome(status="other_failure", http_status=429)
-            not_before = round_up_to_whole_second(
-                _utcnow() + _timedelta(delay + 0.25)
-            )
-            if attempts >= MAX_POST_ATTEMPTS:
-                return DeliveryOutcome(
-                    status="retry_exhausted", not_before=not_before, http_status=429
-                )
-            sleep_seconds = delay + 0.25
-            if sleep_seconds > MAX_SLEEP_SECONDS:
-                return DeliveryOutcome(
-                    status="retry_exhausted", not_before=not_before, http_status=429
-                )
-            time.sleep(sleep_seconds)
-            continue
+    if response.status_code == 429:
+        delay = _parse_retry_after(response)
+        if delay is None:
+            return PostResult(kind="rate_limited", not_before=None, http_status=429)
+        not_before = round_up_to_whole_second(_utcnow() + _timedelta(delay + 0.25))
+        return PostResult(kind="rate_limited", not_before=not_before, http_status=429)
 
-        if response.status_code in (401, 403, 404):
-            return DeliveryOutcome(status="permanent_failure", http_status=response.status_code)
+    if response.status_code in (401, 403, 404):
+        return PostResult(kind="permanent_failure", http_status=response.status_code)
 
-        return DeliveryOutcome(status="other_failure", http_status=response.status_code)
-
-    return DeliveryOutcome(status="retry_exhausted")
+    return PostResult(kind="other_failure", http_status=response.status_code)
 
 
 def _timedelta(seconds: float):
@@ -929,23 +992,57 @@ def _save_state_safe(state: dict) -> bool:
         return False
 
 
+_SUMMARY_FIELD_NAMES = (
+    "total_fetched",
+    "malformed_identity",
+    "malformed_required_field",
+    "conflicting_duplicate",
+    "status_mismatch",
+    "style_mismatch",
+    "state_mismatch",
+    "city_mismatch",
+    "price_out_of_range",
+    "sqft_out_of_range",
+    "hoa_unknown",
+    "hoa_nonzero",
+    "eligible",
+    "already_seen",
+    "candidate",
+    "confirmed",
+    "unsent",
+    "baseline_created",
+)
+
+
 def _main_impl() -> int:
     started = time.monotonic()
+    # Populated as each stage runs; a field stays None if that stage was
+    # never reached, so the final summary always reports what actually
+    # happened rather than inventing zeros for unattempted work.
+    summary_fields: dict[str, Any] = {name: None for name in _SUMMARY_FIELD_NAMES}
+    summary_fields["baseline_created"] = False
+
+    def finish(code: int) -> int:
+        log_event(
+            "scan_summary",
+            elapsed_seconds=round(time.monotonic() - started, 3),
+            **summary_fields,
+        )
+        return code
 
     try:
         dry_run = _read_dry_run_flag()
     except ValueError as exc:
         log_event("config_invalid", level=logging.ERROR, reason=str(exc))
-        return 1
+        return finish(1)
 
     try:
         state = load_state()
     except StateError as exc:
         log_event("state_invalid", level=logging.ERROR, reason=type(exc).__name__)
-        return 1
+        return finish(1)
 
     webhook_url: Optional[str] = None
-    digest: Optional[str] = None
     effective_disabled_digest = state["disabled_webhook_sha256"]
     effective_gate = parse_utc(state["discord_not_before"])
 
@@ -954,12 +1051,12 @@ def _main_impl() -> int:
             webhook_url = get_canonical_webhook_url()
         except WebhookConfigError as exc:
             log_event("webhook_config_invalid", level=logging.ERROR, reason=str(exc))
-            return 1
+            return finish(1)
         digest = sha256_hex(webhook_url)
 
         if effective_disabled_digest == digest:
             log_event("webhook_disabled")
-            return 1
+            return finish(1)
 
         if effective_disabled_digest is not None and effective_disabled_digest != digest:
             effective_disabled_digest = None
@@ -967,7 +1064,7 @@ def _main_impl() -> int:
         now = _utcnow()
         if effective_gate is not None and now < effective_gate:
             log_event("webhook_backoff", not_before=state["discord_not_before"])
-            return 0
+            return finish(0)
         if effective_gate is not None and now >= effective_gate:
             effective_gate = None
 
@@ -975,7 +1072,7 @@ def _main_impl() -> int:
         df = fetch_listings()
     except Exception as exc:  # noqa: BLE001 - any scrape failure must be caught
         log_event("scrape_failed", level=logging.ERROR, error_class=type(exc).__name__)
-        return 1
+        return finish(1)
 
     observed_at = _utcnow()
 
@@ -983,35 +1080,35 @@ def _main_impl() -> int:
         validate_fetch_shape(df)
     except FetchShapeError as exc:
         log_event(exc.reason, level=logging.ERROR)
-        return 1
+        return finish(1)
 
     eligible, counts = process_dataframe(df)
     eligible_identities = sorted(eligible.keys())
-
-    def summary(**extra: Any) -> None:
-        log_event(
-            "scan_summary",
-            total_fetched=counts.total_fetched,
-            malformed_identity=counts.malformed_identity,
-            malformed_required_field=counts.malformed_required_field,
-            conflicting_duplicate=counts.conflicting_duplicate,
-            status_mismatch=counts.status_mismatch,
-            style_mismatch=counts.style_mismatch,
-            state_mismatch=counts.state_mismatch,
-            city_mismatch=counts.city_mismatch,
-            price_out_of_range=counts.price_out_of_range,
-            sqft_out_of_range=counts.sqft_out_of_range,
-            hoa_unknown=counts.hoa_unknown,
-            hoa_nonzero=counts.hoa_nonzero,
-            eligible=counts.eligible,
-            elapsed_seconds=round(time.monotonic() - started, 3),
-            **extra,
-        )
+    summary_fields.update(
+        total_fetched=counts.total_fetched,
+        malformed_identity=counts.malformed_identity,
+        malformed_required_field=counts.malformed_required_field,
+        conflicting_duplicate=counts.conflicting_duplicate,
+        status_mismatch=counts.status_mismatch,
+        style_mismatch=counts.style_mismatch,
+        state_mismatch=counts.state_mismatch,
+        city_mismatch=counts.city_mismatch,
+        price_out_of_range=counts.price_out_of_range,
+        sqft_out_of_range=counts.sqft_out_of_range,
+        hoa_unknown=counts.hoa_unknown,
+        hoa_nonzero=counts.hoa_nonzero,
+        eligible=counts.eligible,
+    )
 
     if not state["initialized"]:
+        try:
+            _build_all_payloads(eligible, eligible_identities, observed_at)
+        except PayloadError as exc:
+            log_event("payload_invalid", level=logging.ERROR, reason=str(exc))
+            return finish(1)
+        summary_fields["candidate"] = len(eligible_identities)
         if dry_run:
-            summary(baseline_created=False, would_baseline=len(eligible_identities))
-            return 0
+            return finish(0)
         new_state = {
             "initialized": True,
             "seen": eligible_identities,
@@ -1019,16 +1116,23 @@ def _main_impl() -> int:
             "discord_not_before": format_utc(effective_gate) if effective_gate else None,
         }
         if not _save_state_safe(new_state):
-            return 1
-        summary(baseline_created=True, would_baseline=len(eligible_identities))
-        return 0
+            return finish(1)
+        summary_fields["baseline_created"] = True
+        log_event("baseline_created", eligible_count=len(eligible_identities))
+        return finish(0)
 
     seen_set = set(state["seen"])
+    summary_fields["already_seen"] = len(seen_set)
     candidates = sorted(identity for identity in eligible_identities if identity not in seen_set)
+    summary_fields["candidate"] = len(candidates)
 
     if dry_run:
-        summary(candidate=len(candidates))
-        return 0
+        try:
+            _build_all_payloads(eligible, candidates, observed_at)
+        except PayloadError as exc:
+            log_event("payload_invalid", level=logging.ERROR, reason=str(exc))
+            return finish(1)
+        return finish(0)
 
     if not candidates:
         current = {
@@ -1039,15 +1143,15 @@ def _main_impl() -> int:
         }
         if not _states_equal(current, state):
             if not _save_state_safe(current):
-                return 1
-        summary(candidate=0, confirmed=0, unsent=0)
-        return 0
+                return finish(1)
+        summary_fields.update(confirmed=0, unsent=0)
+        return finish(0)
 
     try:
-        payloads = {identity: build_payload(eligible[identity], observed_at) for identity in candidates}
+        payloads = _build_all_payloads(eligible, candidates, observed_at)
     except PayloadError as exc:
         log_event("payload_invalid", level=logging.ERROR, reason=str(exc))
-        return 1
+        return finish(1)
 
     session = requests.Session()
     confirmed = 0
@@ -1055,86 +1159,120 @@ def _main_impl() -> int:
     working_disabled = effective_disabled_digest
     working_gate = effective_gate
 
+    def save_current(**overrides: Any) -> bool:
+        payload = {
+            "initialized": True,
+            "seen": sorted(working_seen),
+            "disabled_webhook_sha256": working_disabled,
+            "discord_not_before": format_utc(working_gate) if working_gate else None,
+        }
+        payload.update(overrides)
+        return _save_state_safe(payload)
+
     for position, identity in enumerate(candidates):
-        remaining = _remaining_budget(started)
-        if remaining < POST_RESERVE_SECONDS:
-            log_event("budget_exhausted", level=logging.ERROR, candidate=identity)
-            return 1
+        attempts = 0
+        delivered = False
+        while True:
+            attempts += 1
+            remaining = _remaining_budget(started)
+            if remaining < POST_RESERVE_SECONDS:
+                log_event("budget_exhausted", level=logging.ERROR, candidate=identity)
+                summary_fields.update(confirmed=confirmed, unsent=len(candidates) - confirmed)
+                return finish(1)
 
-        outcome = send_one(session, webhook_url, payloads[identity])
+            result = post_once(session, webhook_url, payloads[identity])
 
-        if outcome.status == "confirmed":
-            working_seen.add(identity)
-            working_gate = outcome.not_before if outcome.not_before else None
-            if not _save_state_safe(
-                {
-                    "initialized": True,
-                    "seen": sorted(working_seen),
-                    "disabled_webhook_sha256": working_disabled,
-                    "discord_not_before": format_utc(working_gate) if working_gate else None,
-                }
-            ):
-                return 1
-            confirmed += 1
-            log_event("delivered", identity=identity, http_status=outcome.http_status)
+            if result.kind in ("confirmed", "confirmed_unknown_exhaustion"):
+                working_seen.add(identity)
+                if result.kind == "confirmed":
+                    working_gate = result.not_before
+                # else: unknown-exhaustion carries no new gate information;
+                # the identity is still durably confirmed before stopping.
+                if not save_current():
+                    return finish(1)
+                confirmed += 1
+                log_event("delivered", identity=identity, http_status=result.http_status)
+                delivered = True
 
-            is_last = position == len(candidates) - 1
-            if not is_last:
+                if result.kind == "confirmed_unknown_exhaustion":
+                    log_event(
+                        "rate_limit_exhaustion_unknown", level=logging.ERROR, identity=identity
+                    )
+                    summary_fields.update(confirmed=confirmed, unsent=len(candidates) - confirmed)
+                    return finish(1)
+                break
+
+            if result.kind == "rate_limited":
+                if result.not_before is None:
+                    log_event("rate_limit_invalid_delay", level=logging.ERROR, identity=identity)
+                    summary_fields.update(confirmed=confirmed, unsent=len(candidates) - confirmed)
+                    return finish(1)
+                working_gate = result.not_before
+                if not save_current():
+                    return finish(1)
+                if attempts >= MAX_POST_ATTEMPTS:
+                    log_event("rate_limited_exhausted", level=logging.ERROR, identity=identity)
+                    summary_fields.update(confirmed=confirmed, unsent=len(candidates) - confirmed)
+                    return finish(1)
+                sleep_seconds = max(0.0, (working_gate - _utcnow()).total_seconds())
                 remaining = _remaining_budget(started)
-                wait_seconds = MIN_POST_INTERVAL_SECONDS
-                if working_gate is not None:
-                    gate_wait = (working_gate - _utcnow()).total_seconds()
-                    wait_seconds = max(wait_seconds, gate_wait)
-                if wait_seconds > MAX_SLEEP_SECONDS or remaining < wait_seconds + POST_RESERVE_SECONDS:
-                    log_event("budget_exhausted_before_sleep", level=logging.ERROR)
-                    return 1
-                if wait_seconds > 0:
-                    time.sleep(wait_seconds)
-            continue
+                if sleep_seconds > MAX_SLEEP_SECONDS or remaining < sleep_seconds + POST_RESERVE_SECONDS:
+                    log_event(
+                        "budget_exhausted_before_sleep", level=logging.ERROR, identity=identity
+                    )
+                    summary_fields.update(confirmed=confirmed, unsent=len(candidates) - confirmed)
+                    return finish(1)
+                if sleep_seconds > 0:
+                    time.sleep(sleep_seconds)
+                continue
 
-        if outcome.status == "permanent_failure":
-            saved = _save_state_safe(
-                {
-                    "initialized": True,
-                    "seen": sorted(working_seen),
-                    "disabled_webhook_sha256": sha256_hex(webhook_url),
-                    "discord_not_before": format_utc(working_gate) if working_gate else None,
-                }
+            if result.kind == "permanent_failure":
+                saved = save_current(disabled_webhook_sha256=sha256_hex(webhook_url))
+                if saved:
+                    log_event(
+                        "webhook_permanent_failure", level=logging.ERROR, http_status=result.http_status
+                    )
+                summary_fields.update(confirmed=confirmed, unsent=len(candidates) - confirmed)
+                return finish(1)
+
+            log_event(
+                "delivery_failed", level=logging.ERROR, identity=identity, http_status=result.http_status
             )
-            if saved:
-                log_event(
-                    "webhook_permanent_failure",
-                    level=logging.ERROR,
-                    http_status=outcome.http_status,
-                )
-            return 1
+            summary_fields.update(confirmed=confirmed, unsent=len(candidates) - confirmed)
+            return finish(1)
 
-        if outcome.status == "retry_exhausted" and outcome.not_before is not None:
-            working_gate = outcome.not_before
-            saved = _save_state_safe(
-                {
-                    "initialized": True,
-                    "seen": sorted(working_seen),
-                    "disabled_webhook_sha256": working_disabled,
-                    "discord_not_before": format_utc(working_gate),
-                }
-            )
-            if saved:
-                log_event("rate_limited", level=logging.ERROR, identity=identity)
-            return 1
+        is_last = position == len(candidates) - 1
+        if delivered and not is_last:
+            remaining = _remaining_budget(started)
+            wait_seconds = MIN_POST_INTERVAL_SECONDS
+            if working_gate is not None:
+                gate_wait = (working_gate - _utcnow()).total_seconds()
+                wait_seconds = max(wait_seconds, gate_wait)
+            if wait_seconds > MAX_SLEEP_SECONDS or remaining < wait_seconds + POST_RESERVE_SECONDS:
+                log_event("budget_exhausted_before_sleep", level=logging.ERROR)
+                summary_fields.update(confirmed=confirmed, unsent=len(candidates) - confirmed)
+                return finish(1)
+            if wait_seconds > 0:
+                time.sleep(wait_seconds)
 
-        log_event("delivery_failed", level=logging.ERROR, identity=identity, http_status=outcome.http_status)
-        return 1
+    summary_fields.update(confirmed=confirmed, unsent=len(candidates) - confirmed)
+    return finish(0)
 
-    summary(candidate=len(candidates), confirmed=confirmed, unsent=len(candidates) - confirmed)
-    return 0
+
+def _build_all_payloads(
+    eligible: dict[str, dict], identities: list[str], observed_at: datetime
+) -> dict[str, dict]:
+    """Build and validate every candidate payload up front (spec section 6):
+    a later invalid payload must prevent even the first candidate from being
+    sent, in both dry-run and real delivery."""
+    return {identity: build_payload(eligible[identity], observed_at) for identity in identities}
 
 
 def main() -> int:
     try:
         return _main_impl()
     except Exception as exc:  # noqa: BLE001 - last-resort safety net per spec section 7
-        log_event("unexpected_error", level=logging.ERROR, error_class=type(exc).__name__)
+        log_event("unexpected_error", level=logging.ERROR, error_class=type(exc).__name__, phase="_main_impl")
         return 1
 
 
