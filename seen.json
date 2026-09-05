@@ -1,7 +1,10 @@
 {
   "version": 1,
-  "initialized": false,
-  "seen": [],
+  "initialized": true,
+  "seen": [
+    "5142618847:2993099219",
+    "5235597373:2998433955"
+  ],
   "disabled_webhook_sha256": null,
   "discord_not_before": null
 }
