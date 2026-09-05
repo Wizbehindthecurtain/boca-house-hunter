@@ -1,0 +1,2 @@
+homeharvest @ git+https://github.com/ZacharyHampton/HomeHarvest.git@8a6ac96db419b56a18d295935217649039bcdd0a
+requests==2.32.4

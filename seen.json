@@ -1,0 +1,7 @@
+{
+  "version": 1,
+  "initialized": false,
+  "seen": [],
+  "disabled_webhook_sha256": null,
+  "discord_not_before": null
+}
