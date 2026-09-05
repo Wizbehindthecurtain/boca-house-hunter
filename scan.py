@@ -519,14 +519,15 @@ def process_dataframe(df: pd.DataFrame) -> tuple[dict[str, dict], ScanCounts]:
     counts = ScanCounts(total_fetched=len(df))
     groups: dict[str, list[tuple[str, Optional[dict]]]] = {}
 
-    # Row access goes through .at[] rather than df.iterrows(): iterrows()
+    # Row access goes through .iat[] rather than df.iterrows(): iterrows()
     # constructs a per-row Series spanning every column, which can attempt a
     # common-dtype/numeric coercion across columns and raise OverflowError
     # for a large-magnitude value even in an object-dtype column, aborting
     # the whole scan before a single malformed row could be rejected. Scalar
-    # .at[] access performs no such cross-column coercion.
-    for idx in df.index:
-        row = {col: df.at[idx, col] for col in df.columns}
+    # .iat[] access performs no such cross-column coercion. Positional access
+    # also preserves individual rows when the source repeats index labels.
+    for position, idx in enumerate(df.index):
+        row = {col: df.iat[position, column] for column, col in enumerate(df.columns)}
         identity, kind, fields = _normalize_row(row)
         if kind == "malformed_identity":
             counts.malformed_identity += 1
@@ -1368,6 +1369,10 @@ def _main_impl() -> int:
                 result = post_once(session, webhook_url, payloads[identity])
 
                 if result.kind in ("confirmed", "confirmed_unknown_exhaustion"):
+                    # Record the remote fact before any fallible local work,
+                    # including unexpected exceptions during persistence.
+                    confirmed += 1
+                    summary_fields.update(confirmed=confirmed, unsent=len(candidates) - confirmed)
                     working_seen.add(identity)
                     if result.kind == "confirmed":
                         working_gate = result.not_before
@@ -1379,18 +1384,6 @@ def _main_impl() -> int:
                     # else: unknown-exhaustion carries no new gate information;
                     # the identity is still durably confirmed before stopping.
                     save_ok = save_current()
-                    # The remote message WAS confirmed delivered regardless of
-                    # whether the local save just above succeeded: "confirmed"
-                    # reflects that delivery fact, with persistence failure
-                    # surfaced separately via state_write_failed, so a save
-                    # failure right after a real confirmation doesn't leave
-                    # the summary claiming nothing happened.
-                    confirmed += 1
-                    # Updated immediately, not just at specific return sites
-                    # below: this is what keeps the summary accurate even if
-                    # something later in this loop raises an exception that
-                    # only the outer unexpected-error handler catches.
-                    summary_fields.update(confirmed=confirmed, unsent=len(candidates) - confirmed)
                     log_event("delivered", identity=identity, http_status=result.http_status)
                     if not save_ok:
                         summary_fields.update(confirmed=confirmed, unsent=len(candidates) - confirmed)

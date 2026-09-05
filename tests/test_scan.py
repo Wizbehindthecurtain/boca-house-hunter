@@ -12,6 +12,8 @@ tests verify against.
 from __future__ import annotations
 
 import hashlib
+import inspect
+import io
 import json
 import math
 import runpy
@@ -19,13 +21,14 @@ import shutil
 import socket
 import tempfile
 import unittest
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 from unittest import mock
 
 import pandas as pd
+import numpy as np
 
 import scan
 
@@ -33,24 +36,37 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 SPEC_PATH = REPO_ROOT / "docs" / "codex-review" / "2026-09-05-codex-spec.md"
 FROZEN_NOW = datetime(2026, 9, 5, 12, 0, 0, tzinfo=timezone.utc)
 
-_socket_guard_patcher = None
+_network_guards = None
+_network_attempts = []
+
+
+class UnexpectedNetworkAttempt(BaseException):
+    """Must escape application handlers that intentionally catch Exception."""
 
 
 def _blocked_socket(*args, **kwargs):
-    raise AssertionError("no test in this suite may open a real socket")
+    # Do not record arguments: they could contain credentials. The durable
+    # record also detects an attempt if a library catches BaseException.
+    _network_attempts.append("unexpected network attempt")
+    raise UnexpectedNetworkAttempt("no test in this suite may use real transport")
 
 
 def setUpModule():
     # Suite-wide defense in depth: every test already mocks scrape_property
     # and requests.Session.post directly, but this ensures nothing in this
     # file can silently fall through to a real network call.
-    global _socket_guard_patcher
-    _socket_guard_patcher = mock.patch("socket.socket", side_effect=_blocked_socket)
-    _socket_guard_patcher.start()
+    global _network_guards
+    _network_attempts.clear()
+    _network_guards = ExitStack()
+    for target in ("socket.socket", "socket.create_connection", "socket.getaddrinfo",
+                   "requests.sessions.Session.request", "requests.sessions.Session.send"):
+        _network_guards.enter_context(mock.patch(target, side_effect=_blocked_socket))
 
 
 def tearDownModule():
-    _socket_guard_patcher.stop()
+    _network_guards.close()
+    if _network_attempts:
+        raise AssertionError(f"{len(_network_attempts)} unexpected network attempts recorded")
 
 
 def base_row(**overrides) -> dict:
@@ -180,6 +196,31 @@ def patched_clock(clock: FakeClock):
 
 VALID_WEBHOOK = "https://discord.com/api/webhooks/123456789012345678/abcDEF-token_123"
 CANONICAL_WEBHOOK = "https://discord.com/api/v10/webhooks/123456789012345678/abcDEF-token_123"
+
+FETCH_KWARGS = dict(
+    location="Boca Raton, FL", listing_type="for_sale", property_type=["single_family"],
+    sqft_min=1700, price_min=250000, price_max=650000, exclude_pending=True,
+    mls_only=False, extra_property_data=False, return_type="pandas", limit=10000,
+    offset=0, parallel=False,
+)
+
+
+def assert_summary(test, logs, *, observed=True, **overrides):
+    """Check every contract count, including zero and not-yet-observed values."""
+    names = (
+        "total_fetched malformed_identity malformed_required_field duplicate_group "
+        "conflicting_duplicate status_mismatch style_mismatch state_mismatch "
+        "city_mismatch price_out_of_range sqft_out_of_range hoa_unknown hoa_nonzero "
+        "eligible already_seen candidate confirmed unsent"
+    ).split()
+    expected = dict.fromkeys(names, 0 if observed else None)
+    expected["baseline_created"] = False
+    expected.update(overrides)
+    lines = [line for line in logs if "event=scan_summary" in line]
+    test.assertEqual(len(lines), 1)
+    actual = dict(part.split("=", 1) for part in lines[0].split() if "=" in part)
+    test.assertEqual({key: actual.get(key) for key in expected},
+                     {key: str(value) for key, value in expected.items()})
 
 
 def run_main(dry_run: bool, webhook: str | None = VALID_WEBHOOK):
@@ -1187,12 +1228,20 @@ class ConfirmationAndPartialFailureTests(unittest.TestCase):
             )
             responses = [FakeResponse(200, {"id": "1"}), FakeResponse(500)]
             post_calls = []
+            sleep_states = []
 
             def fake_post(self, url, **kwargs):
                 post_calls.append(json.loads(fx.read_bytes())["seen"])
                 return responses.pop(0)
 
             clock = FakeClock()
+            real_sleep = clock.sleep
+
+            def inspect_sleep(seconds):
+                sleep_states.append(json.loads(fx.read_bytes())["seen"])
+                real_sleep(seconds)
+
+            clock.sleep = inspect_sleep
             with mock.patch.object(scan, "scrape_property", return_value=df), mock.patch.object(
                 scan.requests.Session, "post", new=fake_post
             ), patched_clock(clock), self.assertLogs("boca_house_hunter", level="ERROR") as logs:
@@ -1203,6 +1252,8 @@ class ConfirmationAndPartialFailureTests(unittest.TestCase):
             # seen yet; by B's POST, A was already durably saved.
             self.assertEqual(post_calls[0], [])
             self.assertEqual(post_calls[1], ["1:1"])
+            self.assertEqual(sleep_states, [["1:1"]])
+            self.assertEqual(clock.sleep_calls, [0.5])
             self.assertTrue(
                 any("event=delivery_failed" in line and "http_status=500" in line for line in logs.output)
             )
@@ -1827,7 +1878,7 @@ class LiteralContractTests(unittest.TestCase):
 
 
 class OfflineCliDryRunTests(unittest.TestCase):
-    def _run_copied_script(self, seen_state: dict, rows=None):
+    def _run_copied_script(self, seen_state: dict, rows=None, fail_second_payload=False):
         tmpdir = tempfile.TemporaryDirectory()
         try:
             script_copy = Path(tmpdir.name) / "scan.py"
@@ -1846,17 +1897,51 @@ class OfflineCliDryRunTests(unittest.TestCase):
 
             df = make_df(rows if rows is not None else [base_row(), base_row(property_id="999", hoa_fee=None)])
 
-            def blocked_socket(*args, **kwargs):
-                raise OSError("network disabled in offline dry-run test")
+            payload_attempts = []
+
+            def fetch_fixture(**kwargs):
+                # Install a fault/observation seam in the executing copy's
+                # globals, not in imported scan (which would test nothing).
+                # The copied file remains byte-identical to production.
+                frame = inspect.currentframe().f_back
+                try:
+                    while frame.f_globals.get("__file__") != str(script_copy):
+                        frame = frame.f_back
+                    namespace = frame.f_globals
+                    build = namespace["build_payload"]
+
+                    def observed_build(fields, observed_at):
+                        payload_attempts.append(fields["property_id"])
+                        if fail_second_payload and len(payload_attempts) == 2:
+                            raise namespace["PayloadError"]("injected later-candidate failure")
+                        return build(fields, observed_at)
+
+                    namespace["build_payload"] = observed_build
+                finally:
+                    del frame
+                return df
+
+            write_attempts = []
+            real_open = open
+
+            def read_only_open(file, mode="r", *args, **kwargs):
+                if any(flag in mode for flag in "wax+"):
+                    write_attempts.append("write")
+                    raise AssertionError("dry run must never open a file for writing")
+                return real_open(file, mode, *args, **kwargs)
 
             def blocked_sleep(*args, **kwargs):
                 raise AssertionError("dry run must never sleep")
 
             try:
                 _os.chdir(other_cwd)
-                with mock.patch("homeharvest.scrape_property", return_value=df), mock.patch.object(
-                    socket, "socket", side_effect=blocked_socket
-                ), mock.patch("time.sleep", side_effect=blocked_sleep), self.assertLogs(
+                with mock.patch("homeharvest.scrape_property", side_effect=fetch_fixture) as fetch, mock.patch(
+                    "requests.Session.post", side_effect=AssertionError("dry run must never POST")
+                ) as post, mock.patch("time.sleep", side_effect=blocked_sleep) as sleep, mock.patch(
+                    "builtins.open", side_effect=read_only_open
+                ), mock.patch.object(io, "open", side_effect=read_only_open), mock.patch(
+                    "os.replace", side_effect=AssertionError("dry run must never replace state")
+                ) as replace, self.assertLogs(
                     "boca_house_hunter", level="INFO"
                 ) as logs:
                     try:
@@ -1864,6 +1949,14 @@ class OfflineCliDryRunTests(unittest.TestCase):
                         exit_code = 0
                     except SystemExit as exc:
                         exit_code = exc.code or 0
+                fetch.assert_called_once_with(**FETCH_KWARGS)
+                post.assert_not_called()
+                sleep.assert_not_called()
+                replace.assert_not_called()
+                self.assertEqual(write_attempts, [])
+                self.assertFalse((Path(tmpdir.name) / "seen.json.tmp").exists())
+                if fail_second_payload:
+                    self.assertEqual(payload_attempts, ["1", "2"])
             finally:
                 _os.chdir(original_cwd)
                 _os.environ.clear()
@@ -1884,6 +1977,7 @@ class OfflineCliDryRunTests(unittest.TestCase):
         summary_lines = [line for line in logs if "event=scan_summary" in line]
         self.assertEqual(len(summary_lines), 1)
         self.assertIn("candidate=1", summary_lines[0])
+        assert_summary(self, logs, total_fetched=2, hoa_unknown=1, eligible=1, candidate=1)
 
     def test_offline_cli_dry_run_initialized(self):
         # Fetched rows contain BOTH an already-seen eligible pair (so
@@ -1892,7 +1986,7 @@ class OfflineCliDryRunTests(unittest.TestCase):
         # this exercises a real would-send candidate rather than a
         # permanently-zero count.
         exit_code, before, after, logs = self._run_copied_script(
-            initial_state_dict(initialized=True, seen=["555555:111111"]),
+            initial_state_dict(initialized=True, seen=["555555:111111", "888:1"]),
             rows=[base_row(), base_row(property_id="555555", listing_id="111111")],
         )
         self.assertEqual(exit_code, 0)
@@ -1903,6 +1997,7 @@ class OfflineCliDryRunTests(unittest.TestCase):
         self.assertIn("already_seen=1", summary_lines[0])
         self.assertIn("confirmed=0", summary_lines[0])
         self.assertIn("unsent=1", summary_lines[0])
+        assert_summary(self, logs, total_fetched=2, eligible=2, already_seen=1, candidate=1, unsent=1)
 
     def test_dry_run_cli_entrypoint_ignores_disabled_digest_and_future_gate(self):
         # Named to avoid matching the "-k offline_cli_dry_run" filter used by
@@ -1916,17 +2011,614 @@ class OfflineCliDryRunTests(unittest.TestCase):
         exit_code, before, after, logs = self._run_copied_script(
             initial_state_dict(
                 initialized=True,
-                seen=[],
+                seen=["555555:111111", "888:1"],
                 disabled_webhook_sha256="a" * 64,
                 discord_not_before=future,
             ),
-            rows=[base_row()],
+            rows=[base_row(), base_row(property_id="555555", listing_id="111111")],
         )
         self.assertEqual(exit_code, 0)
         self.assertEqual(before, after)
         summary_lines = [line for line in logs if "event=scan_summary" in line]
         self.assertEqual(len(summary_lines), 1)
         self.assertIn("candidate=1", summary_lines[0])
+        assert_summary(self, logs, total_fetched=2, eligible=2, already_seen=1, candidate=1, unsent=1)
+
+    def test_copied_cli_later_payload_failure_has_no_effects(self):
+        exit_code, before, after, logs = self._run_copied_script(
+            initial_state_dict(initialized=True),
+            rows=[base_row(property_id="1"), base_row(property_id="2")],
+            fail_second_payload=True,
+        )
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(before, after)
+        self.assertTrue(any("event=payload_invalid" in line for line in logs))
+        assert_summary(self, logs, total_fetched=2, eligible=2, candidate=2, unsent=2)
+
+
+class RequiredTimingTests(unittest.TestCase):
+    def test_post_reserve_boundary(self):
+        for fetch_seconds, expected_posts in ((125, 1), (125.001, 0)):
+            with self.subTest(fetch_seconds=fetch_seconds), StateFixture() as fx:
+                fx.write(initial_state_dict(initialized=True))
+                clock = FakeClock(start_monotonic=0)
+
+                def fetch(**kwargs):
+                    clock.sleep(fetch_seconds)
+                    return make_df([base_row()])
+
+                with patched_clock(clock) as sleep, mock.patch.object(
+                    scan, "scrape_property", side_effect=fetch
+                ), mock.patch.object(scan.requests.Session, "post", return_value=FakeResponse(200, {"id": "1"})) as post:
+                    rc = run_main(False)
+                self.assertEqual(post.call_count, expected_posts)
+                self.assertEqual(rc, 0 if expected_posts else 1)
+                sleep.assert_not_called()
+                self.assertEqual(scan.load_state()["seen"], ["123456:987654"] if expected_posts else [])
+
+    def test_sleep_reserve_boundary_and_oversleep(self):
+        for fetch_seconds, overrun, expected_posts, expected_sleeps in (
+            (123, 0, 2, 1), (123.001, 0, 1, 0), (123, 0.1, 1, 1),
+        ):
+            with self.subTest(fetch_seconds=fetch_seconds, overrun=overrun), StateFixture() as fx:
+                fx.write(initial_state_dict(initialized=True))
+                clock = FakeClock(start_monotonic=0)
+
+                def fetch(**kwargs):
+                    # Simulate elapsed fetch time without changing UTC's whole-second phase.
+                    clock._mono += fetch_seconds
+                    return make_df([base_row()])
+
+                attempts = []
+
+                def post(*args, **kwargs):
+                    attempts.append(clock.monotonic())
+                    self.assertGreaterEqual(150 - attempts[-1], 25)
+                    if len(attempts) == 1:
+                        return FakeResponse(429, {"retry_after": 1.5})
+                    self.assertEqual(scan.load_state()["discord_not_before"], "2026-09-05T12:00:02Z")
+                    self.assertGreaterEqual(clock.utcnow(), FROZEN_NOW + timedelta(seconds=2))
+                    return FakeResponse(200, {"id": "1"})
+
+                def sleep(seconds):
+                    self.assertEqual(scan.load_state()["discord_not_before"], "2026-09-05T12:00:02Z")
+                    clock.sleep(seconds + overrun)
+
+                with patched_clock(clock), mock.patch.object(scan.time, "sleep", side_effect=sleep) as sleeper, mock.patch.object(
+                    scan, "scrape_property", side_effect=fetch
+                ), mock.patch.object(scan.requests.Session, "post", side_effect=post):
+                    rc = run_main(False)
+                self.assertEqual(len(attempts), expected_posts)
+                self.assertEqual(sleeper.call_count, expected_sleeps)
+                self.assertEqual(rc, 0 if expected_posts == 2 else 1)
+                if rc:
+                    self.assertEqual(scan.load_state()["seen"], [])
+                    self.assertEqual(scan.load_state()["discord_not_before"], "2026-09-05T12:00:02Z")
+
+    def test_both_clocks_and_disk_at_retry_or_exhausted_success_next_post(self):
+        for success in (False, True):
+            for movement in ("backward_during_sleep", "forward_during_save"):
+                with self.subTest(success=success, movement=movement), StateFixture() as fx:
+                    fx.write(initial_state_dict(initialized=True))
+                    clock = FakeClock(start_monotonic=0)
+                    rows = [base_row(property_id="1", listing_id="1")]
+                    if success:
+                        rows.append(base_row(property_id="2", listing_id="1"))
+                    attempts = []
+                    save = scan.save_state
+
+                    def save_and_jump(state):
+                        save(state)
+                        if movement == "forward_during_save":
+                            clock.jump_utc_only(10)
+
+                    def sleep(seconds):
+                        state = scan.load_state()
+                        self.assertEqual(state["seen"], ["1:1"] if success else [])
+                        self.assertEqual(state["discord_not_before"], "2026-09-05T12:00:02Z")
+                        clock.sleep(seconds)
+                        if movement == "backward_during_sleep" and len(clock.sleep_calls) == 1:
+                            clock.rewind_utc_only(1)
+
+                    def post(*args, **kwargs):
+                        attempts.append(kwargs["json"])
+                        if len(attempts) == 1:
+                            return (FakeResponse(200, {"id": "1"}, {
+                                "X-RateLimit-Remaining": "0", "X-RateLimit-Reset-After": "1.5"
+                            }) if success else FakeResponse(429, {"retry_after": 1.5}))
+                        self.assertGreaterEqual(clock.monotonic(), 1.75)
+                        self.assertGreaterEqual(clock.utcnow(), FROZEN_NOW + timedelta(seconds=2))
+                        state = scan.load_state()
+                        self.assertEqual(state["seen"], ["1:1"] if success else [])
+                        self.assertEqual(state["discord_not_before"], "2026-09-05T12:00:02Z")
+                        return FakeResponse(200, {"id": "2"})
+
+                    with patched_clock(clock), mock.patch.object(scan.time, "sleep", side_effect=sleep), mock.patch.object(
+                        scan, "save_state", side_effect=save_and_jump
+                    ), mock.patch.object(scan, "scrape_property", return_value=make_df(rows)), mock.patch.object(
+                        scan.requests.Session, "post", side_effect=post
+                    ):
+                        self.assertEqual(run_main(False), 0)
+                    self.assertEqual(len(attempts), 2)
+                    if not success:
+                        self.assertEqual(attempts[0], attempts[1])
+
+    def test_response_created_long_gates_suppress_next_run(self):
+        for delay in (31, 360):
+            for success in (False, True):
+                with self.subTest(delay=delay, success=success), StateFixture() as fx:
+                    fx.write(initial_state_dict(initialized=True))
+                    response = (FakeResponse(200, {"id": "1"}, {
+                        "X-RateLimit-Remaining": "0", "X-RateLimit-Reset-After": str(delay)
+                    }) if success else FakeResponse(429, {"retry_after": delay}))
+                    with patched_clock(FakeClock()) as sleep, mock.patch.object(
+                        scan, "scrape_property", return_value=make_df([
+                            base_row(property_id="1", listing_id="1"), base_row(property_id="2", listing_id="1")
+                        ])
+                    ), mock.patch.object(scan.requests.Session, "post", return_value=response) as post:
+                        self.assertEqual(run_main(False), 1)
+                    post.assert_called_once()
+                    sleep.assert_not_called()
+                    state = scan.load_state()
+                    self.assertEqual(state["seen"], ["1:1"] if success else [])
+                    self.assertEqual(state["discord_not_before"],
+                                     (FROZEN_NOW + timedelta(seconds=delay + 1)).strftime("%Y-%m-%dT%H:%M:%SZ"))
+                    before = fx.read_bytes()
+                    with patched_clock(FakeClock()) as sleep, mock.patch.object(scan, "scrape_property") as fetch, mock.patch.object(
+                        scan.requests.Session, "post"
+                    ) as post, mock.patch.object(scan, "save_state") as save:
+                        self.assertEqual(run_main(False), 0)
+                    for effect in (fetch, post, sleep, save):
+                        effect.assert_not_called()
+                    self.assertEqual(fx.read_bytes(), before)
+
+
+class RequiredAccountingTests(unittest.TestCase):
+    def test_accepted_integer_and_leading_zero_ids_survive_save_and_reload(self):
+        for property_id in (123456, np.int64(123456), 10**63, "000123"):
+            with self.subTest(property_id=property_id), StateFixture() as fx:
+                fx.write(initial_state_dict())
+                df = make_df([base_row()]).astype(object)
+                df.at[0, "property_id"] = property_id
+                with mock.patch.object(scan, "scrape_property", return_value=df), mock.patch.object(
+                    scan.requests.Session, "post"
+                ) as post, mock.patch.object(scan, "save_state", wraps=scan.save_state) as save:
+                    self.assertEqual(run_main(False), 0)
+                post.assert_not_called()
+                save.assert_called_once()
+                self.assertEqual(scan.load_state()["seen"], [f"{property_id}:987654"])
+
+    def test_oversized_integer_mixed_dataframe_and_repeated_index_labels(self):
+        for repeated_index in (False, True):
+            with self.subTest(repeated_index=repeated_index), StateFixture() as fx:
+                fx.write(initial_state_dict(initialized=True))
+                df = make_df([base_row(property_id="1"), base_row(property_id="2")]).astype(object)
+                df.at[0, "property_id"] = 10**5000
+                if repeated_index:
+                    df.index = [7, 7]
+                with mock.patch.object(scan, "scrape_property", return_value=df), mock.patch.object(
+                    scan.requests.Session, "post", return_value=FakeResponse(200, {"id": "1"})
+                ) as post, self.assertLogs("boca_house_hunter", level="INFO") as logs:
+                    self.assertEqual(run_main(False), 0)
+                post.assert_called_once()
+                self.assertEqual(scan.load_state()["seen"], ["2:987654"])
+                assert_summary(self, logs.output, total_fetched=2, malformed_identity=1,
+                               eligible=1, candidate=1, confirmed=1)
+                self.assertFalse(any("unexpected_error" in line for line in logs.output))
+
+    def test_payload_failure_summaries_in_all_modes(self):
+        for initialized in (False, True):
+            for dry_run in (False, True):
+                with self.subTest(initialized=initialized, dry_run=dry_run), StateFixture() as fx:
+                    fx.write(initial_state_dict(initialized=initialized))
+                    before = fx.read_bytes()
+                    with mock.patch.object(scan, "scrape_property", return_value=make_df([
+                        base_row(property_id="1"), base_row(property_id="2")
+                    ])), mock.patch.object(scan, "build_payload", side_effect=scan.PayloadError("injected")), mock.patch.object(
+                        scan.requests.Session, "post"
+                    ) as post, mock.patch.object(scan, "save_state") as save, self.assertLogs("boca_house_hunter", level="INFO") as logs:
+                        self.assertEqual(run_main(dry_run), 1)
+                    post.assert_not_called()
+                    save.assert_not_called()
+                    self.assertEqual(fx.read_bytes(), before)
+                    assert_summary(self, logs.output, total_fetched=2, eligible=2, candidate=2,
+                                   unsent=2 if initialized else 0)
+
+    def test_confirmation_counts_survive_later_post_gate_save_and_unexpected_save_failures(self):
+        for failure in ("later_post", "later_gate_save", "unexpected_confirmation_save"):
+            with self.subTest(failure=failure), StateFixture() as fx:
+                fx.write(initial_state_dict(initialized=True))
+                responses = [FakeResponse(200, {"id": "1"}),
+                             RuntimeError("injected") if failure == "later_post" else FakeResponse(429, {"retry_after": 1.5})]
+                save = scan.save_state
+                saves = []
+
+                def failing_save(state):
+                    saves.append(state)
+                    if failure == "unexpected_confirmation_save":
+                        raise RuntimeError("injected")
+                    if len(saves) == 2:
+                        raise OSError("injected")
+                    save(state)
+
+                with patched_clock(FakeClock()) as sleep, mock.patch.object(scan, "scrape_property", return_value=make_df([
+                    base_row(property_id="1", listing_id="1"), base_row(property_id="2", listing_id="1")
+                ])), mock.patch.object(scan.requests.Session, "post", side_effect=responses) as post, mock.patch.object(
+                    scan, "save_state", side_effect=failing_save
+                ), self.assertLogs("boca_house_hunter", level="INFO") as logs:
+                    self.assertEqual(run_main(False), 1)
+                self.assertEqual(post.call_count, 1 if failure == "unexpected_confirmation_save" else 2)
+                self.assertEqual(sleep.call_count, 0 if failure == "unexpected_confirmation_save" else 1)
+                self.assertEqual(scan.load_state()["seen"], [] if failure == "unexpected_confirmation_save" else ["1:1"])
+                assert_summary(self, logs.output, total_fetched=2, eligible=2, candidate=2, confirmed=1, unsent=1)
+
+    def test_no_candidate_recovery_save_failure_counts(self):
+        with StateFixture() as fx:
+            fx.write(initial_state_dict(initialized=True, seen=["123456:987654"], disabled_webhook_sha256="a" * 64))
+            before = fx.read_bytes()
+            with mock.patch.object(scan, "scrape_property", return_value=make_df([base_row()])), mock.patch.object(
+                scan, "save_state", side_effect=OSError("injected")
+            ) as save, mock.patch.object(scan.requests.Session, "post") as post, self.assertLogs("boca_house_hunter", level="INFO") as logs:
+                self.assertEqual(run_main(False), 1)
+            save.assert_called_once()
+            post.assert_not_called()
+            self.assertEqual(fx.read_bytes(), before)
+            assert_summary(self, logs.output, total_fetched=1, eligible=1, already_seen=1)
+
+    def test_early_failure_reports_unobserved_counts(self):
+        with StateFixture() as fx:
+            fx.state_path.write_text("{}", encoding="utf-8")
+            with mock.patch.object(scan, "scrape_property") as fetch, mock.patch.object(
+                scan.requests.Session, "post"
+            ) as post, mock.patch.object(scan, "save_state") as save, self.assertLogs("boca_house_hunter", level="INFO") as logs:
+                self.assertEqual(run_main(False), 1)
+            for effect in (fetch, post, save):
+                effect.assert_not_called()
+            assert_summary(self, logs.output, observed=False)
+
+    def test_duplicate_totals_and_seen_overlap_exclude_absent_history(self):
+        with StateFixture() as fx:
+            fx.write(initial_state_dict(initialized=True, seen=["1:1", "8:1", "9:1"]))
+            rows = [base_row(property_id="1", listing_id="1")] * 2 + [
+                base_row(property_id="2", listing_id="1"), base_row(property_id="2", listing_id="1", hoa_fee=20),
+                base_row(property_id="3", listing_id="1"),
+            ]
+            with mock.patch.object(scan, "scrape_property", return_value=make_df(rows)), self.assertLogs("boca_house_hunter", level="INFO") as logs:
+                self.assertEqual(run_main(True), 0)
+            assert_summary(self, logs.output, total_fetched=5, duplicate_group=2, conflicting_duplicate=1,
+                           eligible=2, already_seen=1, candidate=1, unsent=1)
+
+
+class RequiredPersistenceTests(unittest.TestCase):
+    def test_actual_write_flush_fsync_close_replace_order(self):
+        with StateFixture() as fx:
+            fx.write(initial_state_dict())
+            events = []
+            real_open, real_fsync, real_replace = open, scan.os.fsync, scan.os.replace
+
+            class RecordingFile:
+                def __enter__(self):
+                    return self
+
+                def write(self, text):
+                    events.append("write")
+                    return self.handle.write(text)
+
+                def flush(self):
+                    events.append("flush")
+                    return self.handle.flush()
+
+                def fileno(self):
+                    return self.handle.fileno()
+
+                def __exit__(self, *exc):
+                    self.handle.close()
+                    events.append("close")
+
+            def recording_open(*args, **kwargs):
+                self.assertEqual(args, (fx.tmp_path, "w"))
+                self.assertEqual(kwargs, dict(encoding="utf-8", newline="\n"))
+                handle = RecordingFile()
+                handle.handle = real_open(*args, **kwargs)
+                return handle
+
+            def fsync(fd):
+                events.append("fsync")
+                real_fsync(fd)
+
+            def replace(source, target):
+                events.append("replace")
+                self.assertEqual((source, target), (fx.tmp_path, fx.state_path))
+                real_replace(source, target)
+
+            with mock.patch("builtins.open", side_effect=recording_open), mock.patch.object(
+                scan.os, "fsync", side_effect=fsync
+            ), mock.patch.object(scan.os, "replace", side_effect=replace):
+                scan.save_state(initial_state_dict(initialized=True, seen=["1:1"]))
+            self.assertEqual(events, ["write", "flush", "fsync", "close", "replace"])
+            self.assertEqual(scan.load_state()["seen"], ["1:1"])
+            self.assertFalse(fx.tmp_path.exists())
+
+    def test_persistence_failures_preserve_bytes_and_stop_before_sleep_or_next_post(self):
+        for failure in ("serialization", "write", "flush", "fsync", "replace"):
+            for response_kind in ("confirmed", "rate_limited"):
+                with self.subTest(failure=failure, response_kind=response_kind), StateFixture() as fx, ExitStack() as stack:
+                    fx.write(initial_state_dict(initialized=True))
+                    before = fx.read_bytes()
+                    real_open = open
+
+                    @contextmanager
+                    def failing_file(*args, **kwargs):
+                        with real_open(*args, **kwargs) as handle:
+                            proxy = mock.Mock(wraps=handle)
+                            getattr(proxy, failure).side_effect = OSError("injected")
+                            yield proxy
+
+                    if failure == "serialization":
+                        stack.enter_context(mock.patch.object(scan.json, "dumps", side_effect=ValueError("injected")))
+                    elif failure in ("write", "flush"):
+                        stack.enter_context(mock.patch("builtins.open", side_effect=failing_file))
+                    else:
+                        stack.enter_context(mock.patch.object(scan.os, failure, side_effect=OSError("injected")))
+                    response = FakeResponse(200, {"id": "1"}) if response_kind == "confirmed" else FakeResponse(429, {"retry_after": 1.5})
+                    with patched_clock(FakeClock()) as sleep, mock.patch.object(scan, "scrape_property", return_value=make_df([
+                        base_row(property_id="1"), base_row(property_id="2")
+                    ])), mock.patch.object(scan.requests.Session, "post", return_value=response) as post, self.assertLogs(
+                        "boca_house_hunter", level="INFO"
+                    ) as logs:
+                        self.assertEqual(run_main(False), 1)
+                    post.assert_called_once()
+                    sleep.assert_not_called()
+                    self.assertEqual(fx.read_bytes(), before)
+                    self.assertTrue(any("event=state_write_failed" in line for line in logs.output))
+                    assert_summary(self, logs.output, total_fetched=2, eligible=2, candidate=2,
+                                   confirmed=int(response_kind == "confirmed"), unsent=1 if response_kind == "confirmed" else 2)
+
+    def test_recovery_ordering_and_exactly_one_healthy_save(self):
+        for scenario in ("changed_secret_future_gate", "expired_gate_failed_fetch", "no_candidates", "baseline"):
+            with self.subTest(scenario=scenario), StateFixture() as fx:
+                baseline = scenario == "baseline"
+                fx.write(initial_state_dict(
+                    initialized=not baseline, seen=[] if baseline else ["123456:987654"],
+                    disabled_webhook_sha256="a" * 64,
+                    discord_not_before="2099-01-01T00:00:00Z" if scenario == "changed_secret_future_gate" else "2020-01-01T00:00:00Z",
+                ))
+                before = fx.read_bytes()
+                with patched_clock(FakeClock()) as sleep, mock.patch.object(scan, "scrape_property", return_value=make_df([base_row()])) as fetch, mock.patch.object(
+                    scan.requests.Session, "post"
+                ) as post, mock.patch.object(scan, "save_state", wraps=scan.save_state) as save:
+                    if scenario == "expired_gate_failed_fetch":
+                        fetch.side_effect = RuntimeError("injected")
+                    self.assertEqual(run_main(False), 1 if scenario == "expired_gate_failed_fetch" else 0)
+                self.assertEqual(fetch.call_count, 0 if scenario == "changed_secret_future_gate" else 1)
+                post.assert_not_called()
+                sleep.assert_not_called()
+                healthy = scenario in ("no_candidates", "baseline")
+                self.assertEqual(save.call_count, int(healthy))
+                if healthy:
+                    self.assertEqual(scan.load_state(), initial_state_dict(initialized=True, seen=["123456:987654"]))
+                else:
+                    self.assertEqual(fx.read_bytes(), before)
+                self.assertFalse(fx.tmp_path.exists())
+
+
+class RequiredBoundaryTests(unittest.TestCase):
+    def test_confirmation_shapes_ids_statuses_and_read_timeout(self):
+        responses = [FakeResponse(200, body) for body in (
+            [], [dict(id="1")], "1", 1, True, {}, {"id": None}, {"id": 1},
+            {"id": True}, {"id": ""}, {"id": " 1"}, {"id": "1.0"}, {"id": "١"},
+        )]
+        responses += [FakeResponse(200, raise_json=True)]
+        responses += [FakeResponse(status, {"id": "1"}) for status in (201, 202, 204, 206, 301, 302, 307, 308)]
+        responses += [scan.requests.ReadTimeout("injected")]
+        for case, response in enumerate(responses):
+            with self.subTest(case=case), StateFixture() as fx:
+                fx.write(initial_state_dict(initialized=True))
+                before = fx.read_bytes()
+                with mock.patch.object(scan, "scrape_property", return_value=make_df([base_row()])), mock.patch.object(
+                    scan.requests.Session, "post", side_effect=[response]
+                ) as post, mock.patch.object(scan.time, "sleep") as sleep, mock.patch.object(scan, "save_state") as save:
+                    self.assertEqual(run_main(False), 1)
+                post.assert_called_once()
+                self.assertFalse(post.call_args.kwargs["allow_redirects"])
+                sleep.assert_not_called()
+                save.assert_not_called()
+                self.assertEqual(fx.read_bytes(), before)
+
+    def test_exact_full_payload_and_post_fetch_observation_time(self):
+        with StateFixture() as fx:
+            fx.write(initial_state_dict(initialized=True))
+            clock = FakeClock()
+
+            def fetch(**kwargs):
+                clock.sleep(7)
+                return make_df([base_row()])
+
+            with patched_clock(clock), mock.patch.object(scan, "scrape_property", side_effect=fetch), mock.patch.object(
+                scan.requests.Session, "post", return_value=FakeResponse(200, {"id": "1"})
+            ) as post:
+                self.assertEqual(run_main(False), 0)
+            self.assertEqual(post.call_args.kwargs["json"], {
+                "username": "Boca House Hunter", "allowed_mentions": {"parse": []},
+                "embeds": [{
+                    "title": "New match: 123 Main St, Boca Raton, FL 33432",
+                    "url": base_row()["property_url"], "color": 3066993,
+                    "fields": [
+                        {"name": "Price", "value": "$400,000", "inline": True},
+                        {"name": "Size", "value": "2,000 sq ft", "inline": True},
+                        {"name": "Beds", "value": "3", "inline": True},
+                        {"name": "Baths", "value": "2 full / 1 half", "inline": True},
+                        {"name": "HOA fee", "value": "$0 reported; association status unverified", "inline": False},
+                        {"name": "Listed", "value": "2026-09-01 (source)", "inline": True},
+                    ],
+                    "footer": {"text": "Realtor.com via HomeHarvest | 123456:987654"},
+                    "timestamp": "2026-09-05T12:00:07Z",
+                }],
+            })
+
+    def test_absent_optional_columns_through_delivery(self):
+        optional = ("formatted_address", "full_street_line", "zip_code", "beds", "full_baths", "half_baths", "list_date")
+        with StateFixture() as fx:
+            fx.write(initial_state_dict(initialized=True))
+            df = make_df([base_row()]).drop(columns=list(optional))
+            with mock.patch.object(scan, "scrape_property", return_value=df), mock.patch.object(
+                scan.requests.Session, "post", return_value=FakeResponse(200, {"id": "1"})
+            ) as post:
+                self.assertEqual(run_main(False), 0)
+            embed = post.call_args.kwargs["json"]["embeds"][0]
+            self.assertEqual(embed["title"], "New match: Boca Raton, FL — property 123456")
+            self.assertEqual([field["value"] for field in embed["fields"]], [
+                "$400,000", "2,000 sq ft", "Unknown", "Unknown full / Unknown half",
+                "$0 reported; association status unverified", "Unknown",
+            ])
+
+    def test_actual_payload_numeric_limits_and_rounding(self):
+        for exponent in (26, 40, 43, 44, 70):
+            with self.subTest(exponent=exponent):
+                fields = scan.process_dataframe(make_df([base_row(
+                    sqft=Decimal(10) ** exponent, beds=Decimal(10) ** exponent,
+                    list_price="400000.005",
+                )]))[0]["123456:987654"]
+                embed = scan.build_payload(fields, FROZEN_NOW)["embeds"][0]
+                values = {field["name"]: field["value"] for field in embed["fields"]}
+                size = f"{10**exponent:,} sq ft"
+                beds = str(10**exponent)
+                self.assertEqual(values["Price"], "$400,000.01")
+                self.assertEqual(values["Size"], size if len(size) <= 64 else "Unknown")
+                self.assertEqual(values["Beds"], beds if len(beds) <= 64 else "Unknown")
+                if exponent == 43:
+                    self.assertEqual(len(values["Size"]), 64)
+
+    def test_actual_payload_rejects_field_footer_and_aggregate_overflow(self):
+        fields = scan.process_dataframe(make_df([base_row()]))[0]["123456:987654"]
+        for message in ("field value", "footer"):
+            # Corrupt just one truncation output; the independent final
+            # validation must reject the actual composed payload.
+            limit = scan.FIELD_VALUE_LIMIT if message == "field value" else scan.FOOTER_LIMIT
+            original = scan.truncate_utf16
+
+            def corrupt(text, requested_limit):
+                return "x" * (requested_limit + 1) if requested_limit == limit else original(text, requested_limit)
+
+            with self.subTest(message=message), mock.patch.object(scan, "truncate_utf16", side_effect=corrupt):
+                with self.assertRaisesRegex(scan.PayloadError, message):
+                    scan.build_payload(fields, FROZEN_NOW)
+        # Reach aggregate validation while staying within individual limits.
+        # Temporarily widened construction budgets make >6000 text reachable.
+        with mock.patch.object(scan, "FIELD_VALUE_LIMIT", 1024), mock.patch.object(
+            scan, "truncate_utf16", side_effect=lambda text, limit: "x" * limit
+        ):
+            with self.assertRaisesRegex(scan.PayloadError, "aggregate"):
+                scan.build_payload(fields, FROZEN_NOW)
+
+    def test_missing_scalars_numpy_booleans_and_contingent(self):
+        cases = [
+            ("hoa_fee", pd.NA, "hoa_unknown"), ("hoa_fee", pd.NaT, "hoa_unknown"),
+            ("hoa_fee", np.bool_(False), "hoa_unknown"),
+            ("list_price", pd.NA, "malformed_required_field"),
+            ("sqft", np.bool_(True), "malformed_required_field"),
+            ("status", pd.NaT, "malformed_required_field"),
+            ("status", "CONTINGENT", "status_mismatch"),
+            ("status", "PENDING", "status_mismatch"),
+            ("property_id", np.bool_(True), "malformed_identity"),
+            ("listing_id", pd.NA, "malformed_identity"),
+            ("property_id", "١٢٣", "malformed_identity"),
+            ("property_id", "１２３", "malformed_identity"),
+        ]
+        for key, value, reason in cases:
+            with self.subTest(key=key, reason=reason):
+                df = make_df([base_row()]).astype(object)
+                df.at[0, key] = value
+                eligible, counts = scan.process_dataframe(df)
+                self.assertEqual(eligible, {})
+                self.assertEqual(getattr(counts, reason), 1)
+
+    def test_unknown_hoa_status_conflicts_and_display_tuple_ties_in_both_orders(self):
+        for changes in ({"hoa_fee": pd.NA}, {"status": "CONTINGENT"}):
+            for reverse in (False, True):
+                rows = [base_row(), base_row(**changes)]
+                eligible, counts = scan.process_dataframe(make_df(rows[::-1] if reverse else rows))
+                self.assertEqual(eligible, {})
+                self.assertEqual((counts.duplicate_group, counts.conflicting_duplicate), (1, 1))
+        # Same address: each successive display component must break ties.
+        for key, small, large in (("beds", 2, 3), ("full_baths", 1, 2), ("half_baths", 0, 1),
+                                  ("list_date", "2026-08-01", "2026-09-01")):
+            for reverse in (False, True):
+                with self.subTest(key=key, reverse=reverse):
+                    rows = [base_row(**{key: small}), base_row(**{key: large})]
+                    eligible, counts = scan.process_dataframe(make_df(rows[::-1] if reverse else rows))
+                    self.assertEqual(eligible["123456:987654"][key], small)
+                    self.assertEqual(counts.duplicate_group, 1)
+
+    def test_invalid_state_types_and_timestamps_fail_before_effects(self):
+        states = [[], None, True, "state"]
+        states += [initial_state_dict(**{key: value}) for key, value in (
+            ("version", "1"), ("initialized", 1), ("seen", {}), ("seen", [1]),
+            ("disabled_webhook_sha256", 1), ("discord_not_before", 1),
+            ("discord_not_before", "2026-02-30T12:00:00Z"),
+            ("discord_not_before", "2026-09-05T24:00:00Z"),
+            ("discord_not_before", "2026-09-05T12:00:00+00:00"),
+            ("discord_not_before", "2026-9-05T12:00:00Z"),
+            ("discord_not_before", "2026-09-05T12:00:00.000Z"),
+            ("discord_not_before", "2026-09-05T12:00:00Z\n"),
+        )]
+        for state in states:
+            with self.subTest(state=state), StateFixture() as fx:
+                fx.write(state)
+                before = fx.read_bytes()
+                with mock.patch.object(scan, "scrape_property") as fetch, mock.patch.object(
+                    scan.requests.Session, "post"
+                ) as post, mock.patch.object(scan, "save_state") as save:
+                    self.assertEqual(run_main(False), 1)
+                for effect in (fetch, post, save):
+                    effect.assert_not_called()
+                self.assertEqual(fx.read_bytes(), before)
+
+    def test_property_and_webhook_url_authority_tables(self):
+        for authority in ("realtor.com", "www.realtor.com", "WWW.REALTOR.COM"):
+            url = scan.normalize_property_url(f"https://{authority}/listing?tracking=1#photo")
+            self.assertEqual(url, f"https://{authority.lower()}/listing")
+        for authority in ("evil.com", "realtor.com.evil.com", "user@realtor.com", "@realtor.com",
+                          "realtor.com:443", "realtor.com:", "realtor.com.", "[::1]"):
+            self.assertIsNone(scan.normalize_property_url(f"https://{authority}/listing"), authority)
+        for url in ("http://realtor.com/listing", "https://realtor.com", "https://realtor.com/" + "x" * 2048):
+            self.assertIsNone(scan.normalize_property_url(url))
+        for authority in ("discord.com", "DISCORD.COM"):
+            for version in ("", "/v10"):
+                self.assertEqual(scan.canonicalize_webhook_url(
+                    f"https://{authority}/api{version}/webhooks/123456789012345678/abcDEF-token_123"
+                ), CANONICAL_WEBHOOK)
+        invalid = [f"https://{authority}/api/webhooks/123/token" for authority in (
+            "discordapp.com", "discord.com.evil.com", "user@discord.com", "@discord.com",
+            "discord.com:443", "discord.com:", "discord.com.", "[::1]",
+        )]
+        invalid += [VALID_WEBHOOK + suffix for suffix in ("?wait=true", "#fragment", "/")]
+        invalid += [VALID_WEBHOOK.replace("https:", "http:"), VALID_WEBHOOK.replace("/api/", "/api/v9/")]
+        for url in invalid:
+            with self.subTest(url=url), StateFixture() as fx:
+                fx.write(initial_state_dict())
+                with mock.patch.object(scan, "scrape_property") as fetch, mock.patch.object(scan.requests.Session, "post") as post:
+                    self.assertEqual(run_main(False, webhook=url), 1)
+                fetch.assert_not_called()
+                post.assert_not_called()
+
+
+class HarnessIsolationTests(unittest.TestCase):
+    def test_guard_escapes_scanner_and_records_even_if_caller_catches_it(self):
+        # Isolated recorder: these deliberately invoked guards are the sole
+        # expected attempts and must not consume the suite's real audit log.
+        attempts = []
+        with mock.patch(f"{__name__}._network_attempts", attempts), StateFixture() as fx:
+            fx.write(initial_state_dict(initialized=True))
+            with mock.patch.object(scan, "scrape_property", side_effect=lambda **kwargs: socket.socket()):
+                with self.assertRaises(UnexpectedNetworkAttempt):
+                    run_main(False)
+            self.assertEqual(len(attempts), 1)
+            with mock.patch.object(scan, "scrape_property", return_value=make_df([base_row()])):
+                with self.assertRaises(UnexpectedNetworkAttempt):
+                    run_main(False)
+            self.assertEqual(len(attempts), 2)
+        self.assertEqual(_network_attempts, [])
 
 
 if __name__ == "__main__":
