@@ -429,11 +429,11 @@ class ScanCounts:
     eligible: int = 0
 
 
-def _row_get(row: pd.Series, key: str) -> Any:
-    return row[key] if key in row.index else None
+def _row_get(row: dict, key: str) -> Any:
+    return row.get(key)
 
 
-def _normalize_row(row: pd.Series) -> tuple[Optional[str], str, Optional[dict]]:
+def _normalize_row(row: dict) -> tuple[Optional[str], str, Optional[dict]]:
     """Returns (identity_or_None, kind, fields_or_None).
 
     kind is "malformed_identity" (identity is None), "malformed_required"
@@ -519,7 +519,14 @@ def process_dataframe(df: pd.DataFrame) -> tuple[dict[str, dict], ScanCounts]:
     counts = ScanCounts(total_fetched=len(df))
     groups: dict[str, list[tuple[str, Optional[dict]]]] = {}
 
-    for idx, row in df.iterrows():
+    # Row access goes through .at[] rather than df.iterrows(): iterrows()
+    # constructs a per-row Series spanning every column, which can attempt a
+    # common-dtype/numeric coercion across columns and raise OverflowError
+    # for a large-magnitude value even in an object-dtype column, aborting
+    # the whole scan before a single malformed row could be rejected. Scalar
+    # .at[] access performs no such cross-column coercion.
+    for idx in df.index:
+        row = {col: df.at[idx, col] for col in df.columns}
         identity, kind, fields = _normalize_row(row)
         if kind == "malformed_identity":
             counts.malformed_identity += 1
@@ -532,6 +539,13 @@ def process_dataframe(df: pd.DataFrame) -> tuple[dict[str, dict], ScanCounts]:
 
     eligible: dict[str, dict] = {}
     for identity, members in groups.items():
+        # Count every usable-identity group with more than one row here,
+        # before deciding whether it conflicts -- conflicting_duplicate below
+        # is specifically the rejected subset, not the whole population of
+        # multi-row groups (spec section 7 asks for both).
+        if len(members) > 1:
+            counts.duplicate_group += 1
+
         # A malformed-required sibling must not be silently hidden behind an
         # otherwise-qualifying row for the same identity: treat the pairing
         # itself as a conflicting duplicate rather than letting the valid
@@ -550,10 +564,6 @@ def process_dataframe(df: pd.DataFrame) -> tuple[dict[str, dict], ScanCounts]:
             ):
                 counts.conflicting_duplicate += 1
                 continue
-            # Agreeing duplicates are a distinct, required accounting bucket
-            # from conflicting ones -- otherwise an identical-duplicate group
-            # collapses into the eligible count with no record it existed.
-            counts.duplicate_group += 1
             chosen = min(rows, key=_tie_break_key)
         else:
             chosen = rows[0]
@@ -1233,16 +1243,18 @@ def _main_impl() -> int:
 
         if not state["initialized"]:
             phase = "baseline"
+            # Baseline sends nothing by design, in both dry and real mode,
+            # and there is no prior seen set for it to compare against.
+            # Set BEFORE attempting payload construction: these are already
+            # known at this point, and a payload failure must not lose them.
+            summary_fields.update(
+                candidate=len(eligible_identities), already_seen=0, confirmed=0, unsent=0
+            )
             try:
                 _build_all_payloads(eligible, eligible_identities, observed_at)
             except PayloadError as exc:
                 log_event("payload_invalid", level=logging.ERROR, reason=str(exc))
                 return finish(1)
-            # Baseline sends nothing by design, in both dry and real mode,
-            # and there is no prior seen set for it to compare against.
-            summary_fields.update(
-                candidate=len(eligible_identities), already_seen=0, confirmed=0, unsent=0
-            )
             if dry_run:
                 return finish(0)
             new_state = {
@@ -1267,16 +1279,20 @@ def _main_impl() -> int:
 
         if dry_run:
             phase = "dry_run_candidates"
+            # Known before payload construction: dry run never delivers.
+            summary_fields.update(confirmed=0, unsent=len(candidates))
             try:
                 _build_all_payloads(eligible, candidates, observed_at)
             except PayloadError as exc:
                 log_event("payload_invalid", level=logging.ERROR, reason=str(exc))
                 return finish(1)
-            summary_fields.update(confirmed=0, unsent=len(candidates))
             return finish(0)
 
         if not candidates:
             phase = "no_candidate_recovery"
+            # Known regardless of whether the (possible) recovery save below
+            # succeeds: there is nothing to send either way.
+            summary_fields.update(confirmed=0, unsent=0)
             current = {
                 "initialized": True,
                 "seen": state["seen"],
@@ -1286,10 +1302,11 @@ def _main_impl() -> int:
             if not _states_equal(current, state):
                 if not _save_state_safe(current):
                     return finish(1)
-            summary_fields.update(confirmed=0, unsent=0)
             return finish(0)
 
         phase = "payload_construction"
+        # Known before attempting construction: nothing has been sent yet.
+        summary_fields.update(confirmed=0, unsent=len(candidates))
         try:
             payloads = _build_all_payloads(eligible, candidates, observed_at)
         except PayloadError as exc:
@@ -1339,6 +1356,15 @@ def _main_impl() -> int:
                     summary_fields.update(confirmed=confirmed, unsent=len(candidates) - confirmed)
                     return finish(1)
 
+                # Recheck the reserve here, not just before the wait above: a
+                # real sleep can run longer than requested (OS scheduling),
+                # so the reserve established before waiting doesn't
+                # guarantee it still holds right before this POST.
+                if _remaining_budget(started) < POST_RESERVE_SECONDS:
+                    log_event("budget_exhausted", level=logging.ERROR, candidate=identity)
+                    summary_fields.update(confirmed=confirmed, unsent=len(candidates) - confirmed)
+                    return finish(1)
+
                 result = post_once(session, webhook_url, payloads[identity])
 
                 if result.kind in ("confirmed", "confirmed_unknown_exhaustion"):
@@ -1360,6 +1386,11 @@ def _main_impl() -> int:
                     # failure right after a real confirmation doesn't leave
                     # the summary claiming nothing happened.
                     confirmed += 1
+                    # Updated immediately, not just at specific return sites
+                    # below: this is what keeps the summary accurate even if
+                    # something later in this loop raises an exception that
+                    # only the outer unexpected-error handler catches.
+                    summary_fields.update(confirmed=confirmed, unsent=len(candidates) - confirmed)
                     log_event("delivered", identity=identity, http_status=result.http_status)
                     if not save_ok:
                         summary_fields.update(confirmed=confirmed, unsent=len(candidates) - confirmed)

@@ -1171,6 +1171,12 @@ class PayloadTests(unittest.TestCase):
 
 class ConfirmationAndPartialFailureTests(unittest.TestCase):
     def test_confirmed_a_then_failed_b_persists_only_a(self):
+        # Uses a coherent FakeClock (not a bare no-op sleep mock): with the
+        # dual-clock _await_gate check, a sleep that never actually advances
+        # monotonic time would fail closed on inter-message pacing *before*
+        # B is ever attempted, making this test pass for the wrong reason
+        # (budget exhaustion, not B's real 500). The clock must genuinely
+        # advance for this to exercise what it claims to.
         with StateFixture() as fx:
             fx.write(initial_state_dict(initialized=True, seen=[]))
             df = make_df(
@@ -1180,17 +1186,45 @@ class ConfirmationAndPartialFailureTests(unittest.TestCase):
                 ]
             )
             responses = [FakeResponse(200, {"id": "1"}), FakeResponse(500)]
+            post_calls = []
 
             def fake_post(self, url, **kwargs):
+                post_calls.append(json.loads(fx.read_bytes())["seen"])
                 return responses.pop(0)
 
+            clock = FakeClock()
             with mock.patch.object(scan, "scrape_property", return_value=df), mock.patch.object(
                 scan.requests.Session, "post", new=fake_post
-            ), mock.patch.object(scan.time, "sleep"):
+            ), patched_clock(clock), self.assertLogs("boca_house_hunter", level="ERROR") as logs:
                 rc = run_main(dry_run=False)
             self.assertEqual(rc, 1)
+            self.assertEqual(len(post_calls), 2, "expected exactly A and B to be attempted")
+            # Durable state at A's POST (before it was confirmed) had nothing
+            # seen yet; by B's POST, A was already durably saved.
+            self.assertEqual(post_calls[0], [])
+            self.assertEqual(post_calls[1], ["1:1"])
+            self.assertTrue(
+                any("event=delivery_failed" in line and "http_status=500" in line for line in logs.output)
+            )
             state = json.loads(fx.read_bytes())
             self.assertEqual(state["seen"], ["1:1"])
+
+            # A second scan must retry only B: A is already seen and must
+            # not be re-sent.
+            responses2 = [FakeResponse(200, {"id": "2"})]
+
+            def fake_post2(url, **kwargs):
+                return responses2.pop(0)
+
+            clock2 = FakeClock()
+            with mock.patch.object(scan, "scrape_property", return_value=df), mock.patch.object(
+                scan.requests.Session, "post", side_effect=fake_post2
+            ) as post2, patched_clock(clock2):
+                rc2 = run_main(dry_run=False)
+            self.assertEqual(rc2, 0)
+            post2.assert_called_once()
+            state2 = json.loads(fx.read_bytes())
+            self.assertEqual(state2["seen"], ["1:1", "2:1"])
 
     def test_200_without_valid_id_and_204_do_not_mark_seen(self):
         for response in (FakeResponse(200, {"nope": "field"}), FakeResponse(204)):
