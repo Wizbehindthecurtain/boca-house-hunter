@@ -16,7 +16,7 @@ import sys
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
+from decimal import ROUND_HALF_UP, Context, Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import urlsplit, urlunsplit
@@ -71,6 +71,14 @@ FOOTER_LIMIT = 200
 ADDRESS_COMPONENT_LIMIT = 200
 NUMERIC_DISPLAY_LIMIT = 64
 DISCORD_TOTAL_TEXT_LIMIT = 6000
+
+# Used for Decimal.quantize() in price/size formatting instead of the ambient
+# default context (28 significant digits): that default can raise
+# InvalidOperation for large-but-legitimately-displayable values (e.g. 1e26),
+# which must not be conflated with genuine display overflow -- the
+# NUMERIC_DISPLAY_LIMIT length check that follows is what actually decides
+# "Unknown", not the Decimal context's precision.
+_QUANTIZE_CONTEXT = Context(prec=1000)
 
 _MARKDOWN_CHARS = ("\\", "`", "*", "_", "~", "|", "[", "]", "<", ">")
 _CONTROL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
@@ -161,7 +169,13 @@ def normalize_identity_component(value: Any) -> Optional[str]:
     if isinstance(value, (int, np.integer)):
         if value < 0:
             return None
-        text = str(int(value))
+        try:
+            text = str(int(value))
+        except ValueError:
+            # Python's int-to-str conversion has a digit-count limit
+            # (sys.get_int_max_str_digits); an oversized magnitude must be
+            # rejected as a malformed identity, not crash normalization.
+            return None
         if len(text) > 64:
             return None
         if set(text) == {"0"}:
@@ -309,6 +323,11 @@ def sanitize_text(value: str) -> str:
     # words that were only separated by a control character.
     text = _WHITESPACE_RE.sub(" ", value).strip()
     text = _CONTROL_RE.sub("", text)
+    # Second collapse/strip: removing controls can itself leave whitespace
+    # behind (e.g. "\x07 \x07" -> " " after control removal), which must not
+    # survive as a truthy "just a space" result -- otherwise a caller's
+    # nonempty-string fallback check would wrongly treat it as real content.
+    text = _WHITESPACE_RE.sub(" ", text).strip()
     text = text.replace("@", "＠")
     for ch in _MARKDOWN_CHARS:
         text = text.replace(ch, "\\" + ch)
@@ -346,7 +365,7 @@ def format_price(price: Decimal) -> str:
         if is_integral:
             text = f"${int(price):,}"
         else:
-            quant = price.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+            quant = price.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP, context=_QUANTIZE_CONTEXT)
             text = f"${quant:,.2f}"
     except (InvalidOperation, OverflowError, ValueError):
         return "Unknown"
@@ -355,7 +374,7 @@ def format_price(price: Decimal) -> str:
 
 def format_size(sqft: Decimal) -> str:
     try:
-        quant = sqft.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        quant = sqft.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP, context=_QUANTIZE_CONTEXT)
         text = f"{quant:,.2f}"
     except (InvalidOperation, OverflowError, ValueError):
         return "Unknown"
@@ -395,6 +414,7 @@ def build_address_display(fields: dict) -> str:
 class ScanCounts:
     malformed_identity: int = 0
     malformed_required_field: int = 0
+    duplicate_group: int = 0
     conflicting_duplicate: int = 0
     status_mismatch: int = 0
     style_mismatch: int = 0
@@ -530,6 +550,10 @@ def process_dataframe(df: pd.DataFrame) -> tuple[dict[str, dict], ScanCounts]:
             ):
                 counts.conflicting_duplicate += 1
                 continue
+            # Agreeing duplicates are a distinct, required accounting bucket
+            # from conflicting ones -- otherwise an identical-duplicate group
+            # collapses into the eligible count with no record it existed.
+            counts.duplicate_group += 1
             chosen = min(rows, key=_tie_break_key)
         else:
             chosen = rows[0]
@@ -835,6 +859,20 @@ def build_payload(fields: dict, observed_at: datetime) -> dict:
         raise PayloadError(f"payload construction failed: {type(exc).__name__}") from exc
 
     embed = payload["embeds"][0]
+
+    # Validate the ACTUAL final strings against the project's own per-field
+    # budgets, independent of trusting that the construction helpers above
+    # (truncate_utf16 etc.) enforced them correctly -- this is deliberately
+    # a second, independent check on the finished payload, not a restatement
+    # of the truncation logic.
+    if _utf16_len(embed["title"]) > TITLE_LIMIT:
+        raise PayloadError("title exceeds project budget")
+    for f in embed["fields"]:
+        if _utf16_len(f["value"]) > FIELD_VALUE_LIMIT:
+            raise PayloadError("field value exceeds project budget")
+    if _utf16_len(embed["footer"]["text"]) > FOOTER_LIMIT:
+        raise PayloadError("footer exceeds project budget")
+
     total_text = (
         _utf16_len(embed["title"])
         + sum(_utf16_len(f["name"]) + _utf16_len(f["value"]) for f in embed["fields"])
@@ -856,15 +894,25 @@ class PostResult:
     # "confirmed": 200 + valid id, not_before set only if a valid exhausted-
     #   bucket delay was present.
     # "confirmed_unknown_exhaustion": 200 + valid id, but X-RateLimit-Remaining
-    #   parsed to zero with no valid Reset-After delay to build a gate from.
-    #   The message WAS delivered, so the identity is still confirmed, but the
-    #   caller must stop the batch rather than guess a bucket duration.
-    # "rate_limited": 429; not_before set only if a valid delay was found.
+    #   parsed to zero with no valid Reset-After delay to build a gate from
+    #   (either absent, or a delay value that exists but can't be turned into
+    #   a usable deadline -- see _safe_not_before). The message WAS delivered,
+    #   so the identity is still confirmed, but the caller must stop the
+    #   batch rather than guess or invent a bucket duration.
+    # "rate_limited": 429; not_before/delay_seconds set only if a valid,
+    #   representable delay was found.
     # "permanent_failure": 401/403/404.
     # "other_failure": anything else (malformed confirmation, timeouts, 5xx,
     #   400, connection errors, ...).
     kind: str
     not_before: Optional[datetime] = None
+    # Same delay (in seconds, including the +0.25 pad) used to derive
+    # not_before, captured separately so the caller can anchor an in-process
+    # monotonic deadline to it. Monotonic tracking is immune to wall-clock
+    # jumps in either direction, which a UTC-only gate is not: this is what
+    # lets the delivery loop honor "both the monotonic delay and the saved
+    # UTC gate" rather than just the persisted one.
+    delay_seconds: Optional[float] = None
     http_status: Optional[int] = None
 
 
@@ -913,6 +961,17 @@ def _parse_reset_after(response: requests.Response) -> Optional[float]:
     return value
 
 
+def _safe_not_before(delay: float) -> Optional[datetime]:
+    """Turn a delay (seconds) into a UTC deadline, or None if the arithmetic
+    can't be represented (e.g. an absurd server-supplied value would overflow
+    datetime's year-9999 ceiling). An unrepresentable delay must be treated
+    as an unusable/invalid one, never clamped or guessed at, per spec."""
+    try:
+        return round_up_to_whole_second(_utcnow() + _timedelta(delay + 0.25))
+    except (OverflowError, ValueError, OSError):
+        return None
+
+
 def post_once(session: requests.Session, url: str, payload: dict) -> PostResult:
     """Perform exactly one POST and classify the response. No sleeping, no
     retry loop, no state mutation: retry/gate/budget/state decisions are the
@@ -940,18 +999,36 @@ def post_once(session: requests.Session, url: str, payload: dict) -> PostResult:
 
         if _remaining_is_exhausted(response):
             reset_delay = _parse_reset_after(response)
-            if reset_delay is None:
+            not_before = None if reset_delay is None else _safe_not_before(reset_delay)
+            if not_before is None:
+                # Either no reset delay was supplied, or it existed but could
+                # not be turned into a usable deadline (see _safe_not_before).
+                # Either way the message was still delivered: confirm it, but
+                # give the caller no gate to persist and let it stop the
+                # batch rather than invent one.
                 return PostResult(kind="confirmed_unknown_exhaustion", http_status=200)
-            not_before = round_up_to_whole_second(_utcnow() + _timedelta(reset_delay + 0.25))
-            return PostResult(kind="confirmed", not_before=not_before, http_status=200)
+            return PostResult(
+                kind="confirmed",
+                not_before=not_before,
+                delay_seconds=reset_delay + 0.25,
+                http_status=200,
+            )
         return PostResult(kind="confirmed", not_before=None, http_status=200)
 
     if response.status_code == 429:
         delay = _parse_retry_after(response)
-        if delay is None:
+        not_before = None if delay is None else _safe_not_before(delay)
+        if not_before is None:
+            # Same treatment as an absent delay: an unrepresentable delay
+            # must never be clamped or guessed at to authorize an early
+            # retry.
             return PostResult(kind="rate_limited", not_before=None, http_status=429)
-        not_before = round_up_to_whole_second(_utcnow() + _timedelta(delay + 0.25))
-        return PostResult(kind="rate_limited", not_before=not_before, http_status=429)
+        return PostResult(
+            kind="rate_limited",
+            not_before=not_before,
+            delay_seconds=delay + 0.25,
+            http_status=429,
+        )
 
     if response.status_code in (401, 403, 404):
         return PostResult(kind="permanent_failure", http_status=response.status_code)
@@ -983,6 +1060,42 @@ def _remaining_budget(started: float) -> float:
     return APP_BUDGET_SECONDS - (time.monotonic() - started)
 
 
+def _await_gate(
+    monotonic_deadline: Optional[float],
+    utc_gate: Optional[datetime],
+    started: float,
+) -> bool:
+    """Sleep, possibly in more than one increment, until BOTH the in-process
+    monotonic deadline and the persisted UTC gate have passed, honoring the
+    overall app budget and the single-sleep bound throughout.
+
+    Two independent clocks are checked because either one alone can be
+    fooled: a UTC-only check can be satisfied early if the wall clock jumps
+    forward (or was never advancing in lockstep with real time), while a
+    monotonic-only check has no persisted meaning across runs. Rechecking
+    both after every sleep (rather than sleeping once and trusting a single
+    up-front computation) protects against the wall clock moving backward
+    mid-sleep, which would otherwise let a stale computed sleep duration
+    authorize an early retry.
+
+    Returns False (without having necessarily waited long enough) if the
+    required wait would exceed the single-sleep bound or the remaining
+    execution budget -- the caller treats that as budget exhaustion.
+    """
+    for _ in range(6):  # bounded: real sleeps make each iteration converge
+        mono_wait = 0.0 if monotonic_deadline is None else max(0.0, monotonic_deadline - time.monotonic())
+        utc_wait = 0.0 if utc_gate is None else max(0.0, (utc_gate - _utcnow()).total_seconds())
+        wait = max(mono_wait, utc_wait)
+        if wait <= 0:
+            return True
+        if wait > MAX_SLEEP_SECONDS:
+            return False
+        if _remaining_budget(started) < wait + POST_RESERVE_SECONDS:
+            return False
+        time.sleep(wait)
+    return False
+
+
 def _save_state_safe(state: dict) -> bool:
     try:
         save_state(state)
@@ -996,6 +1109,7 @@ _SUMMARY_FIELD_NAMES = (
     "total_fetched",
     "malformed_identity",
     "malformed_required_field",
+    "duplicate_group",
     "conflicting_duplicate",
     "status_mismatch",
     "style_mismatch",
@@ -1021,6 +1135,10 @@ def _main_impl() -> int:
     # happened rather than inventing zeros for unattempted work.
     summary_fields: dict[str, Any] = {name: None for name in _SUMMARY_FIELD_NAMES}
     summary_fields["baseline_created"] = False
+    # Updated as each stage begins; read by the outer except below so an
+    # unanticipated exception's log line identifies roughly where in the
+    # pipeline it happened, not just the wrapper that caught it.
+    phase = "startup"
 
     def finish(code: int) -> int:
         log_event(
@@ -1031,232 +1149,291 @@ def _main_impl() -> int:
         return code
 
     try:
-        dry_run = _read_dry_run_flag()
-    except ValueError as exc:
-        log_event("config_invalid", level=logging.ERROR, reason=str(exc))
-        return finish(1)
-
-    try:
-        state = load_state()
-    except StateError as exc:
-        log_event("state_invalid", level=logging.ERROR, reason=type(exc).__name__)
-        return finish(1)
-
-    webhook_url: Optional[str] = None
-    effective_disabled_digest = state["disabled_webhook_sha256"]
-    effective_gate = parse_utc(state["discord_not_before"])
-
-    if not dry_run:
+        phase = "config"
         try:
-            webhook_url = get_canonical_webhook_url()
-        except WebhookConfigError as exc:
-            log_event("webhook_config_invalid", level=logging.ERROR, reason=str(exc))
-            return finish(1)
-        digest = sha256_hex(webhook_url)
-
-        if effective_disabled_digest == digest:
-            log_event("webhook_disabled")
+            dry_run = _read_dry_run_flag()
+        except ValueError as exc:
+            log_event("config_invalid", level=logging.ERROR, reason=str(exc))
             return finish(1)
 
-        if effective_disabled_digest is not None and effective_disabled_digest != digest:
-            effective_disabled_digest = None
+        phase = "state_load"
+        try:
+            state = load_state()
+        except StateError as exc:
+            log_event("state_invalid", level=logging.ERROR, reason=type(exc).__name__)
+            return finish(1)
 
-        now = _utcnow()
-        if effective_gate is not None and now < effective_gate:
-            log_event("webhook_backoff", not_before=state["discord_not_before"])
+        webhook_url: Optional[str] = None
+        effective_disabled_digest = state["disabled_webhook_sha256"]
+        effective_gate = parse_utc(state["discord_not_before"])
+
+        if not dry_run:
+            phase = "webhook_config"
+            try:
+                webhook_url = get_canonical_webhook_url()
+            except WebhookConfigError as exc:
+                log_event("webhook_config_invalid", level=logging.ERROR, reason=str(exc))
+                return finish(1)
+            digest = sha256_hex(webhook_url)
+
+            if effective_disabled_digest == digest:
+                log_event("webhook_disabled")
+                return finish(1)
+
+            if effective_disabled_digest is not None and effective_disabled_digest != digest:
+                effective_disabled_digest = None
+
+            now = _utcnow()
+            if effective_gate is not None and now < effective_gate:
+                log_event("webhook_backoff", not_before=state["discord_not_before"])
+                return finish(0)
+            if effective_gate is not None and now >= effective_gate:
+                effective_gate = None
+
+        phase = "fetch"
+        try:
+            df = fetch_listings()
+        except Exception as exc:  # noqa: BLE001 - any scrape failure must be caught
+            log_event("scrape_failed", level=logging.ERROR, error_class=type(exc).__name__)
+            return finish(1)
+
+        observed_at = _utcnow()
+        if isinstance(df, pd.DataFrame):
+            # Recorded even if shape validation below rejects the result, so
+            # an empty/capped/malformed-column failure still reports how
+            # many rows were actually returned.
+            summary_fields["total_fetched"] = len(df)
+
+        phase = "validate_shape"
+        try:
+            validate_fetch_shape(df)
+        except FetchShapeError as exc:
+            log_event(exc.reason, level=logging.ERROR)
+            return finish(1)
+
+        phase = "normalize"
+        eligible, counts = process_dataframe(df)
+        eligible_identities = sorted(eligible.keys())
+        summary_fields.update(
+            total_fetched=counts.total_fetched,
+            malformed_identity=counts.malformed_identity,
+            malformed_required_field=counts.malformed_required_field,
+            duplicate_group=counts.duplicate_group,
+            conflicting_duplicate=counts.conflicting_duplicate,
+            status_mismatch=counts.status_mismatch,
+            style_mismatch=counts.style_mismatch,
+            state_mismatch=counts.state_mismatch,
+            city_mismatch=counts.city_mismatch,
+            price_out_of_range=counts.price_out_of_range,
+            sqft_out_of_range=counts.sqft_out_of_range,
+            hoa_unknown=counts.hoa_unknown,
+            hoa_nonzero=counts.hoa_nonzero,
+            eligible=counts.eligible,
+        )
+
+        if not state["initialized"]:
+            phase = "baseline"
+            try:
+                _build_all_payloads(eligible, eligible_identities, observed_at)
+            except PayloadError as exc:
+                log_event("payload_invalid", level=logging.ERROR, reason=str(exc))
+                return finish(1)
+            # Baseline sends nothing by design, in both dry and real mode,
+            # and there is no prior seen set for it to compare against.
+            summary_fields.update(
+                candidate=len(eligible_identities), already_seen=0, confirmed=0, unsent=0
+            )
+            if dry_run:
+                return finish(0)
+            new_state = {
+                "initialized": True,
+                "seen": eligible_identities,
+                "disabled_webhook_sha256": effective_disabled_digest,
+                "discord_not_before": format_utc(effective_gate) if effective_gate else None,
+            }
+            if not _save_state_safe(new_state):
+                return finish(1)
+            summary_fields["baseline_created"] = True
+            log_event("baseline_created", eligible_count=len(eligible_identities))
             return finish(0)
-        if effective_gate is not None and now >= effective_gate:
-            effective_gate = None
 
-    try:
-        df = fetch_listings()
-    except Exception as exc:  # noqa: BLE001 - any scrape failure must be caught
-        log_event("scrape_failed", level=logging.ERROR, error_class=type(exc).__name__)
-        return finish(1)
+        seen_set = set(state["seen"])
+        candidates = sorted(identity for identity in eligible_identities if identity not in seen_set)
+        # The eligible/seen OVERLAP, not the total historical seen-set size:
+        # an unrelated large seen history must not be reported as if it were
+        # relevant to this fetch's eligible rows.
+        summary_fields["already_seen"] = len(eligible_identities) - len(candidates)
+        summary_fields["candidate"] = len(candidates)
 
-    observed_at = _utcnow()
-
-    try:
-        validate_fetch_shape(df)
-    except FetchShapeError as exc:
-        log_event(exc.reason, level=logging.ERROR)
-        return finish(1)
-
-    eligible, counts = process_dataframe(df)
-    eligible_identities = sorted(eligible.keys())
-    summary_fields.update(
-        total_fetched=counts.total_fetched,
-        malformed_identity=counts.malformed_identity,
-        malformed_required_field=counts.malformed_required_field,
-        conflicting_duplicate=counts.conflicting_duplicate,
-        status_mismatch=counts.status_mismatch,
-        style_mismatch=counts.style_mismatch,
-        state_mismatch=counts.state_mismatch,
-        city_mismatch=counts.city_mismatch,
-        price_out_of_range=counts.price_out_of_range,
-        sqft_out_of_range=counts.sqft_out_of_range,
-        hoa_unknown=counts.hoa_unknown,
-        hoa_nonzero=counts.hoa_nonzero,
-        eligible=counts.eligible,
-    )
-
-    if not state["initialized"]:
-        try:
-            _build_all_payloads(eligible, eligible_identities, observed_at)
-        except PayloadError as exc:
-            log_event("payload_invalid", level=logging.ERROR, reason=str(exc))
-            return finish(1)
-        summary_fields["candidate"] = len(eligible_identities)
         if dry_run:
+            phase = "dry_run_candidates"
+            try:
+                _build_all_payloads(eligible, candidates, observed_at)
+            except PayloadError as exc:
+                log_event("payload_invalid", level=logging.ERROR, reason=str(exc))
+                return finish(1)
+            summary_fields.update(confirmed=0, unsent=len(candidates))
             return finish(0)
-        new_state = {
-            "initialized": True,
-            "seen": eligible_identities,
-            "disabled_webhook_sha256": effective_disabled_digest,
-            "discord_not_before": format_utc(effective_gate) if effective_gate else None,
-        }
-        if not _save_state_safe(new_state):
-            return finish(1)
-        summary_fields["baseline_created"] = True
-        log_event("baseline_created", eligible_count=len(eligible_identities))
-        return finish(0)
 
-    seen_set = set(state["seen"])
-    summary_fields["already_seen"] = len(seen_set)
-    candidates = sorted(identity for identity in eligible_identities if identity not in seen_set)
-    summary_fields["candidate"] = len(candidates)
+        if not candidates:
+            phase = "no_candidate_recovery"
+            current = {
+                "initialized": True,
+                "seen": state["seen"],
+                "disabled_webhook_sha256": effective_disabled_digest,
+                "discord_not_before": format_utc(effective_gate) if effective_gate else None,
+            }
+            if not _states_equal(current, state):
+                if not _save_state_safe(current):
+                    return finish(1)
+            summary_fields.update(confirmed=0, unsent=0)
+            return finish(0)
 
-    if dry_run:
+        phase = "payload_construction"
         try:
-            _build_all_payloads(eligible, candidates, observed_at)
+            payloads = _build_all_payloads(eligible, candidates, observed_at)
         except PayloadError as exc:
             log_event("payload_invalid", level=logging.ERROR, reason=str(exc))
             return finish(1)
-        return finish(0)
 
-    if not candidates:
-        current = {
-            "initialized": True,
-            "seen": state["seen"],
-            "disabled_webhook_sha256": effective_disabled_digest,
-            "discord_not_before": format_utc(effective_gate) if effective_gate else None,
-        }
-        if not _states_equal(current, state):
-            if not _save_state_safe(current):
-                return finish(1)
-        summary_fields.update(confirmed=0, unsent=0)
-        return finish(0)
+        phase = "delivery"
+        session = requests.Session()
+        confirmed = 0
+        working_seen = set(state["seen"])
+        working_disabled = effective_disabled_digest
+        working_gate = effective_gate
+        # In-process only, never persisted: anchors the required wait to a
+        # clock immune to wall-clock jumps. See _await_gate.
+        working_monotonic_deadline: Optional[float] = None
 
-    try:
-        payloads = _build_all_payloads(eligible, candidates, observed_at)
-    except PayloadError as exc:
-        log_event("payload_invalid", level=logging.ERROR, reason=str(exc))
-        return finish(1)
+        def save_current(**overrides: Any) -> bool:
+            payload = {
+                "initialized": True,
+                "seen": sorted(working_seen),
+                "disabled_webhook_sha256": working_disabled,
+                "discord_not_before": format_utc(working_gate) if working_gate else None,
+            }
+            payload.update(overrides)
+            return _save_state_safe(payload)
 
-    session = requests.Session()
-    confirmed = 0
-    working_seen = set(state["seen"])
-    working_disabled = effective_disabled_digest
-    working_gate = effective_gate
-
-    def save_current(**overrides: Any) -> bool:
-        payload = {
-            "initialized": True,
-            "seen": sorted(working_seen),
-            "disabled_webhook_sha256": working_disabled,
-            "discord_not_before": format_utc(working_gate) if working_gate else None,
-        }
-        payload.update(overrides)
-        return _save_state_safe(payload)
-
-    for position, identity in enumerate(candidates):
-        attempts = 0
-        delivered = False
-        while True:
-            attempts += 1
-            remaining = _remaining_budget(started)
-            if remaining < POST_RESERVE_SECONDS:
-                log_event("budget_exhausted", level=logging.ERROR, candidate=identity)
-                summary_fields.update(confirmed=confirmed, unsent=len(candidates) - confirmed)
-                return finish(1)
-
-            result = post_once(session, webhook_url, payloads[identity])
-
-            if result.kind in ("confirmed", "confirmed_unknown_exhaustion"):
-                working_seen.add(identity)
-                if result.kind == "confirmed":
-                    working_gate = result.not_before
-                # else: unknown-exhaustion carries no new gate information;
-                # the identity is still durably confirmed before stopping.
-                if not save_current():
-                    return finish(1)
-                confirmed += 1
-                log_event("delivered", identity=identity, http_status=result.http_status)
-                delivered = True
-
-                if result.kind == "confirmed_unknown_exhaustion":
-                    log_event(
-                        "rate_limit_exhaustion_unknown", level=logging.ERROR, identity=identity
-                    )
-                    summary_fields.update(confirmed=confirmed, unsent=len(candidates) - confirmed)
-                    return finish(1)
-                break
-
-            if result.kind == "rate_limited":
-                if result.not_before is None:
-                    log_event("rate_limit_invalid_delay", level=logging.ERROR, identity=identity)
-                    summary_fields.update(confirmed=confirmed, unsent=len(candidates) - confirmed)
-                    return finish(1)
-                working_gate = result.not_before
-                if not save_current():
-                    return finish(1)
-                if attempts >= MAX_POST_ATTEMPTS:
-                    log_event("rate_limited_exhausted", level=logging.ERROR, identity=identity)
-                    summary_fields.update(confirmed=confirmed, unsent=len(candidates) - confirmed)
-                    return finish(1)
-                sleep_seconds = max(0.0, (working_gate - _utcnow()).total_seconds())
+        for position, identity in enumerate(candidates):
+            attempts = 0
+            delivered = False
+            while True:
+                attempts += 1
                 remaining = _remaining_budget(started)
-                if sleep_seconds > MAX_SLEEP_SECONDS or remaining < sleep_seconds + POST_RESERVE_SECONDS:
+                if remaining < POST_RESERVE_SECONDS:
+                    log_event("budget_exhausted", level=logging.ERROR, candidate=identity)
+                    summary_fields.update(confirmed=confirmed, unsent=len(candidates) - confirmed)
+                    return finish(1)
+
+                # Honor both the monotonic delay and the persisted UTC gate
+                # before every attempt, not just the first one for this
+                # candidate: this is what makes a 429 retry (and the
+                # inter-message pacing after a success, below) both wait
+                # correctly even if the wall clock misbehaves mid-run.
+                if not _await_gate(working_monotonic_deadline, working_gate, started):
                     log_event(
                         "budget_exhausted_before_sleep", level=logging.ERROR, identity=identity
                     )
                     summary_fields.update(confirmed=confirmed, unsent=len(candidates) - confirmed)
                     return finish(1)
-                if sleep_seconds > 0:
-                    time.sleep(sleep_seconds)
-                continue
 
-            if result.kind == "permanent_failure":
-                saved = save_current(disabled_webhook_sha256=sha256_hex(webhook_url))
-                if saved:
-                    log_event(
-                        "webhook_permanent_failure", level=logging.ERROR, http_status=result.http_status
+                result = post_once(session, webhook_url, payloads[identity])
+
+                if result.kind in ("confirmed", "confirmed_unknown_exhaustion"):
+                    working_seen.add(identity)
+                    if result.kind == "confirmed":
+                        working_gate = result.not_before
+                        working_monotonic_deadline = (
+                            time.monotonic() + result.delay_seconds
+                            if result.delay_seconds is not None
+                            else None
+                        )
+                    # else: unknown-exhaustion carries no new gate information;
+                    # the identity is still durably confirmed before stopping.
+                    save_ok = save_current()
+                    # The remote message WAS confirmed delivered regardless of
+                    # whether the local save just above succeeded: "confirmed"
+                    # reflects that delivery fact, with persistence failure
+                    # surfaced separately via state_write_failed, so a save
+                    # failure right after a real confirmation doesn't leave
+                    # the summary claiming nothing happened.
+                    confirmed += 1
+                    log_event("delivered", identity=identity, http_status=result.http_status)
+                    if not save_ok:
+                        summary_fields.update(confirmed=confirmed, unsent=len(candidates) - confirmed)
+                        return finish(1)
+                    delivered = True
+
+                    if result.kind == "confirmed_unknown_exhaustion":
+                        log_event(
+                            "rate_limit_exhaustion_unknown", level=logging.ERROR, identity=identity
+                        )
+                        summary_fields.update(confirmed=confirmed, unsent=len(candidates) - confirmed)
+                        return finish(1)
+                    break
+
+                if result.kind == "rate_limited":
+                    if result.not_before is None:
+                        log_event("rate_limit_invalid_delay", level=logging.ERROR, identity=identity)
+                        summary_fields.update(confirmed=confirmed, unsent=len(candidates) - confirmed)
+                        return finish(1)
+                    working_gate = result.not_before
+                    working_monotonic_deadline = (
+                        time.monotonic() + result.delay_seconds
+                        if result.delay_seconds is not None
+                        else None
                     )
+                    if not save_current():
+                        return finish(1)
+                    if attempts >= MAX_POST_ATTEMPTS:
+                        log_event("rate_limited_exhausted", level=logging.ERROR, identity=identity)
+                        summary_fields.update(confirmed=confirmed, unsent=len(candidates) - confirmed)
+                        return finish(1)
+                    # Loop back to the top: the next iteration's _await_gate
+                    # call is what actually waits for the gate just set.
+                    continue
+
+                if result.kind == "permanent_failure":
+                    saved = save_current(disabled_webhook_sha256=sha256_hex(webhook_url))
+                    if saved:
+                        log_event(
+                            "webhook_permanent_failure", level=logging.ERROR, http_status=result.http_status
+                        )
+                    summary_fields.update(confirmed=confirmed, unsent=len(candidates) - confirmed)
+                    return finish(1)
+
+                log_event(
+                    "delivery_failed", level=logging.ERROR, identity=identity, http_status=result.http_status
+                )
                 summary_fields.update(confirmed=confirmed, unsent=len(candidates) - confirmed)
                 return finish(1)
 
-            log_event(
-                "delivery_failed", level=logging.ERROR, identity=identity, http_status=result.http_status
-            )
-            summary_fields.update(confirmed=confirmed, unsent=len(candidates) - confirmed)
-            return finish(1)
+            is_last = position == len(candidates) - 1
+            if delivered and not is_last:
+                # Ordinary inter-message pacing (0.5s minimum) is purely an
+                # in-process concern -- there is nothing to persist here
+                # unless a rate-limit response already set a gate above. The
+                # actual wait happens via the next iteration's top-of-loop
+                # _await_gate call, which also enforces budget/bound checks
+                # consistently in one place.
+                pacing_deadline = time.monotonic() + MIN_POST_INTERVAL_SECONDS
+                working_monotonic_deadline = (
+                    pacing_deadline
+                    if working_monotonic_deadline is None
+                    else max(working_monotonic_deadline, pacing_deadline)
+                )
 
-        is_last = position == len(candidates) - 1
-        if delivered and not is_last:
-            remaining = _remaining_budget(started)
-            wait_seconds = MIN_POST_INTERVAL_SECONDS
-            if working_gate is not None:
-                gate_wait = (working_gate - _utcnow()).total_seconds()
-                wait_seconds = max(wait_seconds, gate_wait)
-            if wait_seconds > MAX_SLEEP_SECONDS or remaining < wait_seconds + POST_RESERVE_SECONDS:
-                log_event("budget_exhausted_before_sleep", level=logging.ERROR)
-                summary_fields.update(confirmed=confirmed, unsent=len(candidates) - confirmed)
-                return finish(1)
-            if wait_seconds > 0:
-                time.sleep(wait_seconds)
-
-    summary_fields.update(confirmed=confirmed, unsent=len(candidates) - confirmed)
-    return finish(0)
+        summary_fields.update(confirmed=confirmed, unsent=len(candidates) - confirmed)
+        return finish(0)
+    except Exception as exc:  # noqa: BLE001 - unexpected-bug safety net (spec section 7)
+        # Caught here (not just in main()) so an unanticipated exception
+        # still produces a complete scan_summary reflecting whatever was
+        # actually observed before the failure, with a phase name
+        # identifying roughly where in the pipeline it happened.
+        log_event("unexpected_error", level=logging.ERROR, error_class=type(exc).__name__, phase=phase)
+        return finish(1)
 
 
 def _build_all_payloads(
@@ -1271,8 +1448,12 @@ def _build_all_payloads(
 def main() -> int:
     try:
         return _main_impl()
-    except Exception as exc:  # noqa: BLE001 - last-resort safety net per spec section 7
-        log_event("unexpected_error", level=logging.ERROR, error_class=type(exc).__name__, phase="_main_impl")
+    except Exception as exc:  # noqa: BLE001 - true last resort: _main_impl's own
+        # outer handler already covers ordinary unexpected exceptions and still
+        # emits a scan_summary; this only fires if something escapes even that
+        # (e.g. a failure inside logging/finish() itself), so no summary can be
+        # trusted to be safely constructible here.
+        log_event("unexpected_error", level=logging.ERROR, error_class=type(exc).__name__, phase="main")
         return 1
 
 

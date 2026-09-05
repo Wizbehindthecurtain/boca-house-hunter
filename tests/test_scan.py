@@ -1,8 +1,12 @@
 """Offline behavioral suite for scan.py.
 
-No live network calls are made anywhere in this file. HTTP, sleep, and wall
-clock are always mocked/frozen. See docs/codex-review/2026-09-05-codex-spec.md
-for the contract these tests verify against.
+No live network calls are made anywhere in this file. HTTP and sleep are
+always mocked. Wall clock is frozen in most tests, but tests that exercise
+rate-limit/budget timing use FakeClock (below), which advances a fake
+monotonic and UTC clock together on sleep, and can also simulate the wall
+clock moving independently of real elapsed time -- see the RateLimitAndBudgetTests
+group. See docs/codex-review/2026-09-05-codex-spec.md for the contract these
+tests verify against.
 """
 
 from __future__ import annotations
@@ -15,7 +19,8 @@ import shutil
 import socket
 import tempfile
 import unittest
-from datetime import datetime, timezone
+from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 from unittest import mock
@@ -130,6 +135,49 @@ class StateFixture:
         self._tmpdir.cleanup()
 
 
+class FakeClock:
+    """A coherent fake for scan._utcnow/scan.time.monotonic/scan.time.sleep
+    where sleeping advances both the monotonic and UTC sides together, the
+    way a real sleep does. jump_utc_only()/rewind_utc_only() advance ONLY
+    the UTC side, independent of monotonic/real elapsed time -- this is what
+    lets a test simulate the wall clock misbehaving (an NTP jump forward, or
+    moving backward mid-sleep) that _await_gate is specifically required to
+    tolerate by also checking a monotonic deadline.
+    """
+
+    def __init__(self, start_utc: datetime = FROZEN_NOW, start_monotonic: float = 1_000_000.0):
+        self._utc = start_utc
+        self._mono = start_monotonic
+        self.sleep_calls: list[float] = []
+
+    def utcnow(self) -> datetime:
+        return self._utc
+
+    def monotonic(self) -> float:
+        return self._mono
+
+    def sleep(self, seconds: float) -> None:
+        self.sleep_calls.append(seconds)
+        self._mono += seconds
+        self._utc += timedelta(seconds=seconds)
+
+    def jump_utc_only(self, seconds: float) -> None:
+        self._utc += timedelta(seconds=seconds)
+
+    def rewind_utc_only(self, seconds: float) -> None:
+        self._utc -= timedelta(seconds=seconds)
+
+
+@contextmanager
+def patched_clock(clock: FakeClock):
+    """Patches scan._utcnow/time.monotonic/time.sleep to `clock`'s methods
+    and yields the sleep mock, so a test can still assert on sleep calls."""
+    with mock.patch.object(scan, "_utcnow", side_effect=clock.utcnow), mock.patch.object(
+        scan.time, "monotonic", side_effect=clock.monotonic
+    ), mock.patch.object(scan.time, "sleep", side_effect=clock.sleep) as sleep_mock:
+        yield sleep_mock
+
+
 VALID_WEBHOOK = "https://discord.com/api/webhooks/123456789012345678/abcDEF-token_123"
 CANONICAL_WEBHOOK = "https://discord.com/api/v10/webhooks/123456789012345678/abcDEF-token_123"
 
@@ -229,6 +277,23 @@ class FetchAndRequiredFieldsTests(unittest.TestCase):
                 rc = run_main(dry_run=False)
             self.assertEqual(rc, 1)
 
+    def test_total_fetched_is_reported_even_when_shape_validation_rejects_the_result(self):
+        # A capped (or otherwise shape-invalid) result still returned a real
+        # row count from the DataFrame; that must be visible in the summary
+        # rather than reported as if the fetch never produced anything.
+        with StateFixture() as fx:
+            fx.write(initial_state_dict(initialized=True, seen=[]))
+            df = make_df([base_row(property_id=str(i + 1)) for i in range(5)])
+            with mock.patch.object(scan, "scrape_property", return_value=df), mock.patch.object(
+                scan, "RESULT_CAP", 5
+            ):
+                with self.assertLogs("boca_house_hunter", level="INFO") as logs:
+                    rc = run_main(dry_run=False)
+            self.assertEqual(rc, 1)
+            summary_lines = [line for line in logs.output if "event=scan_summary" in line]
+            self.assertEqual(len(summary_lines), 1)
+            self.assertIn("total_fetched=5", summary_lines[0])
+
 
 # ---------------------------------------------------------------------------
 # Group: scalar eligibility
@@ -316,6 +381,29 @@ class ScalarEligibilityTests(unittest.TestCase):
         self.assertIsNone(scan.normalize_number(Decimal("NaN")))
         self.assertIsNone(scan.normalize_number(Decimal("Infinity")))
 
+    def test_large_but_within_budget_values_display_correctly_not_unknown(self):
+        # The ambient default Decimal context (28 significant digits) used to
+        # be passed implicitly to quantize(), which raised InvalidOperation
+        # for values like 1e26 even though their correct display text fits
+        # well within the 64-character NUMERIC_DISPLAY_LIMIT. That must not
+        # be conflated with genuine display overflow.
+        self.assertEqual(
+            scan.format_size(Decimal("1e26")),
+            "100,000,000,000,000,000,000,000,000 sq ft",
+        )
+        self.assertNotEqual(scan.format_size(Decimal("1e40")), "Unknown")
+        # A large, non-integral price still needs the quantize() path (for
+        # its two-decimal display) and must not hit the same context error.
+        large_non_integral_price = Decimal("1e26") + Decimal("0.5")
+        self.assertNotEqual(scan.format_price(large_non_integral_price), "Unknown")
+
+    def test_genuinely_oversized_values_still_display_unknown(self):
+        # A value whose correct display text would exceed the 64-character
+        # budget must still show Unknown -- the R6 fix only stops precision
+        # loss from masquerading as overflow, it must not remove the actual
+        # overflow check.
+        self.assertEqual(scan.format_size(Decimal("1e70")), "Unknown")
+
 
 # ---------------------------------------------------------------------------
 # Group: identity and duplicate handling
@@ -345,6 +433,21 @@ class IdentityAndDuplicateTests(unittest.TestCase):
         self.assertIsNone(scan.normalize_identity_component(str(10**64)))
         self.assertIsNotNone(scan.normalize_identity_component(10**63))
 
+    def test_extremely_oversized_integer_rejected_without_raising(self):
+        # str(int(10**5000)) exceeds Python's int-to-str conversion digit
+        # limit and raises ValueError; this must be caught and treated as a
+        # malformed identity (returning None), not propagate out of
+        # normalization and abort the whole row/scan.
+        self.assertIsNone(scan.normalize_identity_component(10**5000))
+        # Built as a single object-dtype Series (not through make_df/a full
+        # DataFrame): pandas' own column type-inference can't represent a
+        # 5000-digit int alongside ordinary values without raising its own
+        # OverflowError first, which would test pandas rather than scan.py.
+        row = pd.Series(base_row(property_id=10**5000), dtype=object)
+        identity, kind, fields = scan._normalize_row(row)
+        self.assertIsNone(identity)
+        self.assertEqual(kind, "malformed_identity")
+
     def test_malformed_identities_rejected_without_nan_identity(self):
         bad_values = [None, float("nan"), 123.0, True, "000", "12a3", "x" * 65, "-5"]
         for value in bad_values:
@@ -360,6 +463,16 @@ class IdentityAndDuplicateTests(unittest.TestCase):
         df = make_df([row, dict(row)])
         eligible, counts = scan.process_dataframe(df)
         self.assertEqual(len(eligible), 1)
+        # Agreeing duplicates must still be visible in the required
+        # accounting as a distinct bucket from conflicting ones - an
+        # identical-duplicate group must not silently disappear.
+        self.assertEqual(counts.duplicate_group, 1)
+        self.assertEqual(counts.conflicting_duplicate, 0)
+
+    def test_lone_row_is_not_counted_as_a_duplicate_group(self):
+        df = make_df([base_row()])
+        _, counts = scan.process_dataframe(df)
+        self.assertEqual(counts.duplicate_group, 0)
 
     def test_conflicting_duplicates_suppress_entire_identity(self):
         row_a = base_row(list_price=400000)
@@ -560,9 +673,10 @@ class LifecycleTests(unittest.TestCase):
                 sent_order.append(json["embeds"][0]["footer"]["text"])
                 return FakeResponse(200, {"id": str(len(sent_order))})
 
+            clock = FakeClock()
             with mock.patch.object(scan, "scrape_property", return_value=df), mock.patch.object(
                 scan.requests.Session, "post", new=fake_post
-            ), mock.patch.object(scan.time, "sleep"):
+            ), patched_clock(clock):
                 rc = run_main(dry_run=False)
             self.assertEqual(rc, 0)
             self.assertEqual(
@@ -572,6 +686,9 @@ class LifecycleTests(unittest.TestCase):
                     "Realtor.com via HomeHarvest | 2:1",
                 ],
             )
+            # Inter-message pacing must have actually been honored (not
+            # skipped), even though both candidates ultimately succeeded.
+            self.assertTrue(any(s >= scan.MIN_POST_INTERVAL_SECONDS for s in clock.sleep_calls))
 
 
 # ---------------------------------------------------------------------------
@@ -780,6 +897,39 @@ class AtomicWriteTests(unittest.TestCase):
             self.assertEqual(rc, 1)
             post.assert_called_once()  # second candidate never attempted
 
+    def test_write_failure_right_after_confirmation_still_reports_it_as_confirmed(self):
+        # Reviewer's probe: the remote message WAS confirmed delivered (a
+        # real 200 + valid id came back) even though the immediately
+        # following local save failed. The summary must reflect that one
+        # real delivery happened, not silently report confirmed=None as if
+        # nothing had been observed.
+        with StateFixture() as fx:
+            fx.write(initial_state_dict(initialized=True, seen=[]))
+            df = make_df(
+                [
+                    base_row(property_id="1", listing_id="1"),
+                    base_row(property_id="2", listing_id="1"),
+                ]
+            )
+            response = FakeResponse(200, {"id": "1"})
+
+            def flaky_replace(src, dst):
+                raise OSError("disk full")
+
+            with mock.patch.object(scan, "scrape_property", return_value=df), mock.patch.object(
+                scan.requests.Session, "post", return_value=response
+            ), mock.patch.object(scan.os, "replace", side_effect=flaky_replace), mock.patch.object(
+                scan.time, "sleep"
+            ):
+                with self.assertLogs("boca_house_hunter", level="INFO") as logs:
+                    rc = run_main(dry_run=False)
+            self.assertEqual(rc, 1)
+            summary_lines = [line for line in logs.output if "event=scan_summary" in line]
+            self.assertEqual(len(summary_lines), 1)
+            self.assertIn("candidate=2", summary_lines[0])
+            self.assertIn("confirmed=1", summary_lines[0])
+            self.assertIn("unsent=1", summary_lines[0])
+
 
 # ---------------------------------------------------------------------------
 # Group: payload construction
@@ -879,6 +1029,22 @@ class PayloadTests(unittest.TestCase):
             scan.build_address_display(fields_no_fallback), "Boca Raton, FL — property 9"
         )
 
+    def test_address_falls_back_when_control_removal_leaves_only_whitespace(self):
+        # "\x07 \x07" is nonempty even after a naive single sanitize pass:
+        # collapsing whitespace first (to avoid fusing words) leaves the
+        # single space alone, and removing the two control chars afterward
+        # leaves JUST that space behind -- a bare " " is a truthy Python
+        # string, so without a second whitespace cleanup pass this would
+        # incorrectly win over the street-line fallback.
+        self.assertEqual(scan.sanitize_text("\x07 \x07"), "")
+        fields = {
+            "property_id": "1",
+            "formatted_address": "\x07 \x07",
+            "full_street_line": "5 Elm St",
+            "zip_code": "33432",
+        }
+        self.assertEqual(scan.build_address_display(fields), "5 Elm St, Boca Raton, FL 33432")
+
     def test_address_component_is_utf16_truncated_not_sliced_by_code_point(self):
         emoji_house = "\U0001F3E1"  # astral character, 2 UTF-16 code units each
         fields = {
@@ -940,6 +1106,18 @@ class PayloadTests(unittest.TestCase):
         self.assertEqual(len(encoded) % 2, 0)
         # Must decode cleanly with no lone surrogate.
         encoded.decode("utf-16-le")
+
+    def test_build_payload_independently_validates_final_field_budgets(self):
+        # A fault-injection probe: if truncate_utf16 were ever broken and
+        # returned its input unmodified, build_payload must still catch an
+        # oversized title/field/footer on its own, rather than relying
+        # exclusively on the truncation helper having done its job.
+        fields = scan.process_dataframe(make_df([base_row()]))[0]["123456:987654"]
+        with mock.patch.object(scan, "truncate_utf16", side_effect=lambda text, limit: text):
+            fields_with_long_address = dict(fields)
+            fields_with_long_address["formatted_address"] = "X" * 400
+            with self.assertRaises(scan.PayloadError):
+                scan.build_payload(fields_with_long_address, FROZEN_NOW)
 
     def test_payload_construction_failure_prevents_any_post(self):
         good_fields = scan.process_dataframe(make_df([base_row()]))[0]["123456:987654"]
@@ -1090,11 +1268,10 @@ class RateLimitAndBudgetTests(unittest.TestCase):
                 payloads_sent.append(json)
                 return responses.pop(0)
 
-            with mock.patch.object(scan, "_utcnow", return_value=FROZEN_NOW), mock.patch.object(
-                scan, "scrape_property", return_value=df
-            ), mock.patch.object(scan.requests.Session, "post", new=fake_post), mock.patch.object(
-                scan.time, "sleep"
-            ) as sleep_mock:
+            clock = FakeClock()
+            with mock.patch.object(scan, "scrape_property", return_value=df), mock.patch.object(
+                scan.requests.Session, "post", new=fake_post
+            ), patched_clock(clock) as sleep_mock:
                 rc = run_main(dry_run=False)
             self.assertEqual(rc, 0)
             # max(1.5, 0.5) + 0.25 = 1.75s raw delay, but the actual sleep is
@@ -1114,9 +1291,10 @@ class RateLimitAndBudgetTests(unittest.TestCase):
                 call_count["n"] += 1
                 return response
 
+            clock = FakeClock()
             with mock.patch.object(scan, "scrape_property", return_value=df), mock.patch.object(
                 scan.requests.Session, "post", new=fake_post
-            ), mock.patch.object(scan.time, "sleep"):
+            ), patched_clock(clock):
                 rc = run_main(dry_run=False)
             self.assertEqual(rc, 1)
             self.assertEqual(call_count["n"], scan.MAX_POST_ATTEMPTS)
@@ -1164,11 +1342,13 @@ class RateLimitAndBudgetTests(unittest.TestCase):
             self.assertIsNotNone(state["discord_not_before"])
 
     def test_429_gate_is_durably_saved_before_sleep_and_retry_lands_on_or_after_gate(self):
-        # Reproduces the reviewer's frozen-clock probe: at 12:00:00Z, a 429
-        # body delay of 1.5 must produce a gate of 12:00:02Z (round_up(now +
-        # 1.5 + 0.25)), persisted to disk BEFORE the retry sleep happens, and
-        # the retry must not fire before that gate (i.e. sleep >= 2.0s, not
-        # the raw 1.75s delay).
+        # At 12:00:00Z, a 429 body delay of 1.5 must produce a gate of
+        # 12:00:02Z (round_up(now + 1.5 + 0.25)), persisted to disk BEFORE
+        # the retry sleep happens, and the retry must not fire before that
+        # gate (i.e. sleep >= 2.0s, not the raw 1.75s delay). Uses a coherent
+        # FakeClock (sleep advances both monotonic and UTC together) so the
+        # sleep call genuinely has to happen for the retry to proceed, rather
+        # than a frozen clock that can't distinguish "waited" from "didn't".
         with StateFixture() as fx:
             fx.write(initial_state_dict(initialized=True, seen=[]))
             df = make_df([base_row()])
@@ -1180,22 +1360,114 @@ class RateLimitAndBudgetTests(unittest.TestCase):
             def fake_post(self, url, **kwargs):
                 return responses.pop(0)
 
+            clock = FakeClock()
             observed = []
+            real_sleep = clock.sleep
 
-            def fake_sleep(seconds):
+            def instrumented_sleep(seconds):
                 observed.append((seconds, json.loads(fx.read_bytes())["discord_not_before"]))
+                real_sleep(seconds)
 
-            with mock.patch.object(scan, "_utcnow", return_value=FROZEN_NOW), mock.patch.object(
-                scan, "scrape_property", return_value=df
-            ), mock.patch.object(scan.requests.Session, "post", new=fake_post), mock.patch.object(
-                scan.time, "sleep", side_effect=fake_sleep
-            ):
+            with mock.patch.object(scan, "_utcnow", side_effect=clock.utcnow), mock.patch.object(
+                scan.time, "monotonic", side_effect=clock.monotonic
+            ), mock.patch.object(scan, "scrape_property", return_value=df), mock.patch.object(
+                scan.requests.Session, "post", new=fake_post
+            ), mock.patch.object(scan.time, "sleep", side_effect=instrumented_sleep):
                 rc = run_main(dry_run=False)
             self.assertEqual(rc, 0)
             self.assertEqual(len(observed), 1)
             sleep_seconds, gate_at_sleep_time = observed[0]
+            # The gate was written to disk BEFORE this (the only) sleep call.
             self.assertEqual(gate_at_sleep_time, "2026-09-05T12:00:02Z")
             self.assertGreaterEqual(sleep_seconds, 2.0)
+            state = json.loads(fx.read_bytes())
+            self.assertEqual(state["seen"], ["123456:987654"])
+
+    def test_429_retry_rechecks_gate_after_backward_utc_jump_during_sleep(self):
+        # Reproduces the reviewer's adversarial probe: the wall clock moves
+        # backward by one second mid-sleep (e.g. an NTP correction). A
+        # single up-front sleep computation would then retry one second too
+        # early; _await_gate must recheck both clocks after waking and sleep
+        # again if the gate isn't genuinely satisfied yet.
+        with StateFixture() as fx:
+            fx.write(initial_state_dict(initialized=True, seen=[]))
+            df = make_df([base_row()])
+            responses = [
+                FakeResponse(429, {"retry_after": 1.5}, headers={}),
+                FakeResponse(200, {"id": "1"}),
+            ]
+
+            def fake_post(self, url, **kwargs):
+                return responses.pop(0)
+
+            clock = FakeClock()
+            jumped = {"done": False}
+
+            def adversarial_sleep(seconds):
+                clock.sleep(seconds)
+                if not jumped["done"]:
+                    clock.rewind_utc_only(1.0)
+                    jumped["done"] = True
+
+            with mock.patch.object(scan, "_utcnow", side_effect=clock.utcnow), mock.patch.object(
+                scan.time, "monotonic", side_effect=clock.monotonic
+            ), mock.patch.object(scan, "scrape_property", return_value=df), mock.patch.object(
+                scan.requests.Session, "post", new=fake_post
+            ), mock.patch.object(
+                scan.time, "sleep", side_effect=adversarial_sleep
+            ) as sleep_mock:
+                rc = run_main(dry_run=False)
+            self.assertEqual(rc, 0)
+            # A single-shot sleep-then-retry design would have slept exactly
+            # once and retried early; the backward jump forces a second,
+            # shorter sleep before the retry is actually allowed to proceed.
+            self.assertGreaterEqual(len(sleep_mock.call_args_list), 2)
+            state = json.loads(fx.read_bytes())
+            self.assertEqual(state["seen"], ["123456:987654"])
+
+    def test_429_retry_honors_monotonic_deadline_despite_forward_utc_jump(self):
+        # Reproduces the reviewer's other adversarial probe: the wall clock
+        # jumps forward by far more than real time actually passed (e.g.
+        # while writing state) -- a UTC-only check would then see the gate
+        # as already satisfied and retry immediately. The independent
+        # monotonic deadline must still force the real ~1.75s wait.
+        with StateFixture() as fx:
+            fx.write(initial_state_dict(initialized=True, seen=[]))
+            df = make_df([base_row()])
+            responses = [
+                FakeResponse(429, {"retry_after": 1.5}, headers={}),
+                FakeResponse(200, {"id": "1"}),
+            ]
+
+            def fake_post(self, url, **kwargs):
+                return responses.pop(0)
+
+            clock = FakeClock()
+            jumped = {"done": False}
+            real_save_state = scan.save_state
+
+            def save_state_then_jump(state):
+                real_save_state(state)
+                if not jumped["done"]:
+                    clock.jump_utc_only(10.0)
+                    jumped["done"] = True
+
+            with mock.patch.object(scan, "_utcnow", side_effect=clock.utcnow), mock.patch.object(
+                scan.time, "monotonic", side_effect=clock.monotonic
+            ), mock.patch.object(scan, "scrape_property", return_value=df), mock.patch.object(
+                scan.requests.Session, "post", new=fake_post
+            ), mock.patch.object(
+                scan, "save_state", side_effect=save_state_then_jump
+            ), mock.patch.object(scan.time, "sleep", side_effect=clock.sleep) as sleep_mock:
+                rc = run_main(dry_run=False)
+            self.assertEqual(rc, 0)
+            # Despite UTC now claiming the gate is long past, a real sleep
+            # honoring the monotonic side (~1.75s) still had to happen.
+            slept = [call.args[0] for call in sleep_mock.call_args_list]
+            self.assertTrue(slept, "expected at least one sleep honoring the monotonic deadline")
+            self.assertTrue(any(s >= 1.75 - 1e-9 for s in slept))
+            state = json.loads(fx.read_bytes())
+            self.assertEqual(state["seen"], ["123456:987654"])
 
     def test_429_retry_stops_before_sleep_when_remaining_budget_insufficient(self):
         # Reproduces the reviewer's probe: with the first POST at elapsed 125
@@ -1253,6 +1525,45 @@ class RateLimitAndBudgetTests(unittest.TestCase):
             self.assertEqual(post_calls["n"], 1)
             state = json.loads(fx.read_bytes())
             self.assertEqual(state["seen"], ["1:1"])
+
+    def test_confirmed_with_unrepresentable_reset_delay_still_saves_identity(self):
+        # A 200 with X-RateLimit-Remaining: 0 and a syntactically valid but
+        # astronomically large Reset-After (e.g. 1e20) would overflow
+        # datetime construction if not guarded: the message WAS still
+        # delivered and must be confirmed/saved exactly like the
+        # no-reset-header case, not lose the confirmation to an unhandled
+        # exception.
+        with StateFixture() as fx:
+            fx.write(initial_state_dict(initialized=True, seen=[]))
+            df = make_df(
+                [
+                    base_row(property_id="1", listing_id="1"),
+                    base_row(property_id="2", listing_id="1"),
+                ]
+            )
+            response = FakeResponse(
+                200,
+                {"id": "1"},
+                headers={"X-RateLimit-Remaining": "0", "X-RateLimit-Reset-After": "1e20"},
+            )
+            post_calls = {"n": 0}
+
+            def fake_post(self, url, **kwargs):
+                post_calls["n"] += 1
+                return response
+
+            with mock.patch.object(scan, "scrape_property", return_value=df), mock.patch.object(
+                scan.requests.Session, "post", new=fake_post
+            ), mock.patch.object(scan.time, "sleep") as sleep_mock:
+                with self.assertLogs("boca_house_hunter", level="INFO") as logs:
+                    rc = run_main(dry_run=False)
+            self.assertEqual(rc, 1)
+            sleep_mock.assert_not_called()
+            self.assertEqual(post_calls["n"], 1)
+            state = json.loads(fx.read_bytes())
+            self.assertEqual(state["seen"], ["1:1"])
+            self.assertTrue(any("event=unexpected_error" in line for line in logs.output) is False)
+            self.assertTrue(any("event=rate_limit_exhaustion_unknown" in line for line in logs.output))
 
 
 # ---------------------------------------------------------------------------
@@ -1541,12 +1852,14 @@ class OfflineCliDryRunTests(unittest.TestCase):
         self.assertIn("candidate=1", summary_lines[0])
 
     def test_offline_cli_dry_run_initialized(self):
-        # One already-seen pair (not present in the fetched rows at all) plus
-        # one genuinely new eligible pair, so this exercises a real would-send
-        # candidate rather than a permanently-zero count.
+        # Fetched rows contain BOTH an already-seen eligible pair (so
+        # already_seen reflects a genuine eligible/seen overlap, not just
+        # unrelated seen history) and one genuinely new eligible pair, so
+        # this exercises a real would-send candidate rather than a
+        # permanently-zero count.
         exit_code, before, after, logs = self._run_copied_script(
             initial_state_dict(initialized=True, seen=["555555:111111"]),
-            rows=[base_row()],
+            rows=[base_row(), base_row(property_id="555555", listing_id="111111")],
         )
         self.assertEqual(exit_code, 0)
         self.assertEqual(before, after)
@@ -1554,6 +1867,8 @@ class OfflineCliDryRunTests(unittest.TestCase):
         self.assertEqual(len(summary_lines), 1)
         self.assertIn("candidate=1", summary_lines[0])
         self.assertIn("already_seen=1", summary_lines[0])
+        self.assertIn("confirmed=0", summary_lines[0])
+        self.assertIn("unsent=1", summary_lines[0])
 
     def test_dry_run_cli_entrypoint_ignores_disabled_digest_and_future_gate(self):
         # Named to avoid matching the "-k offline_cli_dry_run" filter used by

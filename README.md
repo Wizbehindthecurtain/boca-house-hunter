@@ -44,12 +44,16 @@ Amendment record (visibility decision, rigor decision): `docs/superpowers/specs/
   success is saved, the same listing can alert again on a later run
   (a duplicate, not a miss). But this does **not** mean misses are
   impossible: a listing that appears and then disappears again entirely
-  between two successful polls is never observed at all, a partial/malformed
-  upstream response is treated as indeterminate and simply retried next run
-  (see `scan_indeterminate_empty`), and there is no durable outbox of
-  candidates that failed to send — a run that stops partway through a batch
-  leaves the *unsent* remainder to be picked up (if still eligible) on the
-  next successful poll, not guaranteed.
+  between two successful polls is never observed at all, and there is no
+  durable outbox of candidates that failed to send — a run that stops
+  partway through a batch leaves the *unsent* remainder to be picked up (if
+  still eligible) on the next successful poll, not guaranteed. An **empty,
+  non-DataFrame, or column-missing** response is treated as indeterminate
+  and simply retried next run (see `scan_indeterminate_empty`) — but a
+  response that comes back nonempty and shape-valid is processed as
+  healthy with no way to detect that it was silently truncated or
+  otherwise partial upstream; that failure mode is not caught by this
+  project.
 - **Best-effort latency, not an SLA.** Approximate latency is broker/MLS →
   Realtor.com publication delay + time until the next successful poll +
   runner startup/scrape time + Discord delivery time. Only the last two are
@@ -134,10 +138,14 @@ Live (requires an actual GitHub Actions run and a real Discord channel) —
 
 1. Set the repo's default branch to `main`, add the `DISCORD_WEBHOOK_URL`
    secret, confirm the default `GITHUB_TOKEN` can push to `main`, and set the
-   target Discord channel/mobile notifications to "All Messages." Keep the
-   schedule disabled while doing this and while performing any of the
-   manual repair steps below — a scheduled run racing a manual one against
-   the same state is not something this project resolves for you.
+   target Discord channel/mobile notifications to "All Messages." Confirm
+   nothing else — no other workflow, script, or person — pushes to
+   `seen.json` or posts to the same webhook; this project has no
+   protection against a second writer, so it must be verified true before
+   the first real delivery, not just spot-checked later. Keep the schedule
+   disabled while doing this and while performing any of the manual repair
+   steps below — a scheduled run racing a manual one against the same
+   state is not something this project resolves for you.
 2. Dispatch the workflow manually with `dry_run=true`. Inspect the run's
    logged counts and manually cross-check a few current Realtor.com results
    for Boca Raton against them. Specifically look for at least one listing
@@ -158,15 +166,17 @@ Live (requires an actual GitHub Actions run and a real Discord channel) —
    dispatch once more. Confirm exactly one real Discord message and one
    state commit; dispatch again and confirm zero further messages.
 5. Re-enable the schedule and, over the following days, check Actions run
-   history for actual start-time gaps, run durations, and whether
-   HomeHarvest is being blocked from the runner's IP range. Also confirm the
-   repo is still on a public standard runner (no private/paid runner or
-   storage got configured) and that nothing else is pushing to `seen.json`
-   or posting to the same webhook concurrently. If scraping is consistently
-   failing, the service is not operational — this is not fixed by adding
-   proxies, alternate scrapers, or relaxing the HOA filter; it needs review.
-   Check Actions history periodically (daily is reasonable) for the life of
-   the tool, not just during initial commissioning.
+   history for actual start-time gaps, run durations, whether HomeHarvest is
+   being blocked from the runner's IP range, and — separately from those —
+   **whether the scheduled runs are actually producing `seen.json` commits**
+   (an on-time, successful-looking run that never pushes state is not
+   proof of persistence; check the commit history itself, not just the run
+   status). Also confirm the repo is still on a public standard runner (no
+   private/paid runner or storage got configured). If scraping is
+   consistently failing, the service is not operational — this is not fixed
+   by adding proxies, alternate scrapers, or relaxing the HOA filter; it
+   needs review. Check Actions history periodically (daily is reasonable)
+   for the life of the tool, not just during initial commissioning.
 
 If `seen.json` state ever looks wrong (missing, corrupted, or the workflow
 fails to push it), disable the schedule, wait for any active run to finish,
@@ -178,12 +188,29 @@ not silently reset.
 
 A 401/403/404 response from Discord permanently disables further sends
 against that specific webhook secret (recorded as a hash in `seen.json`,
-never the secret itself) until you replace `DISCORD_WEBHOOK_URL` with a
-working one. Replacing the secret clears this latch **on the next run that
-reaches that check** — it does not require clearing `seen.json`, and doing
-so would cause every already-alerted listing to re-alert. Note that a
-persisted `discord_not_before` rate-limit gate, or a run that fails before
-it gets that far (e.g. a scrape failure), can delay when that clearing
-actually takes effect — a secret swap is not guaranteed to be picked up on
-the very next scheduled tick. As with any manual state repair, disable the
-schedule and wait for any in-flight run to finish first.
+never the secret itself) until either:
+
+- **You replace `DISCORD_WEBHOOK_URL`** with a working one (e.g. you
+  regenerated the webhook). The very next run computes a different digest,
+  which no longer matches the stored one — but that clearing only happens
+  **in memory** for that run; it is only *saved* back to `seen.json` once
+  that same run reaches a point where it would save anyway (a healthy
+  no-candidate recovery, a confirmed delivery, or a newly-latched permanent
+  failure). If the run fails before then — most commonly a scrape
+  failure, which happens *after* the latch check but before any of those
+  save points — the on-disk digest is left exactly as it was, and the next
+  run repeats the same in-memory clearing attempt.
+- **You fix the same channel/webhook** (e.g. un-blocking a bot, restoring
+  channel permissions) without changing the secret itself. In that case
+  nothing will auto-clear the latch, since the digest never changes: you
+  must manually edit `seen.json` and clear `disabled_webhook_sha256` to
+  `null`, leaving `seen` and `discord_not_before` untouched.
+
+Either way, this **never requires clearing `seen.json`'s `seen` list** —
+doing so would cause every already-alerted listing to re-alert. A persisted
+`discord_not_before` rate-limit gate is independent of the latch and can
+extend well past the next scheduled tick (a long 429/exhausted-bucket delay
+survives across runs and across a secret replacement) — do not delete or
+edit it to force an earlier retry; let it expire naturally. As with any
+manual state repair, disable the schedule and wait for any in-flight run to
+finish first.
